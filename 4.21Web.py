@@ -548,32 +548,28 @@ st.markdown("""
         color: var(--text-dark) !important;
     }
     
-    /* ========== 仅针对 AI 助手消息文字为白色，不影响其他侧边栏内容 ========== */
-    .stChatMessage {
+    /* ========== 确保 AI 助手所有文字为白色（用户和助手消息） ========== */
+    .stChatMessage, .stChatMessage p, .stChatMessage div, .stChatMessage span, .stChatMessage strong, .stChatMessage em {
         color: #ffffff !important;
     }
-    .stChatMessage p {
+    
+    /* 侧边栏 expander 展开时的标题背景改为青蓝色（保持原有样式） */
+    [data-testid="stSidebar"] .stExpander details[open] summary {
+        background-color: #2c7da0 !important;
         color: #ffffff !important;
     }
-/* 强制覆盖侧边栏 expander 展开时的标题背景（仅标题，不改变内容区域） */
-[data-testid="stSidebar"] .stExpander details[open] summary {
-    background-color: #2c7da0 !important;
-    color: #ffffff !important;
-}
-/* 确保其他状态下的标题背景不变（未展开时保持原深色） */
-[data-testid="stSidebar"] .stExpander details summary {
-    background-color: #1f4b5c !important;
-    color: #e6f7ff !important;
-}
-/* 如果上面不生效，用更通用的方式 */
-[data-testid="stSidebar"] .streamlit-expanderHeader[aria-expanded="true"] {
-    background-color: #2c7da0 !important;
-    color: #ffffff !important;
-}
-[data-testid="stSidebar"] .streamlit-expanderHeader {
-    background-color: #1f4b5c !important;
-    color: #e6f7ff !important;
-}       
+    [data-testid="stSidebar"] .stExpander details summary {
+        background-color: #1f4b5c !important;
+        color: #e6f7ff !important;
+    }
+    [data-testid="stSidebar"] .streamlit-expanderHeader[aria-expanded="true"] {
+        background-color: #2c7da0 !important;
+        color: #ffffff !important;
+    }
+    [data-testid="stSidebar"] .streamlit-expanderHeader {
+        background-color: #1f4b5c !important;
+        color: #e6f7ff !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -905,7 +901,6 @@ for option in nav_options:
         st.sidebar.button(option, key=f"nav_{option}", use_container_width=True, on_click=set_page, args=(option,))
 
 st.sidebar.markdown('<hr>', unsafe_allow_html=True)
-
 # ========== AI 助手（侧边栏，导航下方，参数面板上方） ==========
 if "xiaoku_msgs" not in st.session_state:
     st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库。我可以解答本系统的指标含义、参数设置、预测模型、库存策略等问题。"}]
@@ -959,14 +954,55 @@ with st.sidebar:
                         st.error("Key 格式错误，应以 sk- 开头")
                 st.stop()
             
+            # 增强版系统提示词（融入论文知识）
+            system_prompt = """
+你是宠物IP联名产品库存智能决策系统的AI助理“小库”。你的知识库包含以下论文核心内容：
+
+【系统背景】
+本系统专为C公司宠物IP联名产品设计，集成了数据上传、需求特征分析、需求类型自动划分、6种预测模型（加权移动平均、霍尔特双参数+IP调整、季节调整移动平均、基础平稳+IP缓冲、简单指数平滑+衰退系数、朴素预测+批量调整）、滚动窗口交叉验证自动选模、报童模型最优安全库存、差异化补货策略((T,S)/(R,Q)/(s,S))、库存风险可视化等功能。
+
+【核心指标解释】
+- CV (需求变异系数) = 标准差/均值，CV≥0.6表示高波动。
+- 平均需求间隔 p = 总天数/非零需求天数，p≥1.32为间歇型。
+- 趋势强度 T = (最近3期平均 - 最早3期平均)/最早3期平均，|T|>0.01视为有趋势。
+- 季节系数 Fs = 旺季销量/淡季销量，≥1.2有明显季节波动。
+- IP营销波动系数 F_IP = IP营销月销量/非营销月销量，用于放大预测。
+- 报童模型：最优服务水平 = B/(B+H*L)，B为缺货成本，H为日持有成本，L为提前期。
+- 补货策略：(T,S)固定周期补货；(R,Q)连续检查订货点批量；(s,S)连续检查补至目标库存。
+
+【参数设置建议】
+- 平滑系数α、β：默认0.3、0.2，需求稳定可降低，波动大可提高。
+- 趋势放大系数：增长型需求建议1.2~1.5。
+- IP调整上限：默认1.8，避免过度放大。
+- 自定义服务水平：提高会增加安全库存和持有成本，系统会显示与理论最优的差额。
+
+【系统操作说明】
+- 上传销售数据和库存数据后，系统自动计算特征并分类。
+- 在“需求预测”页可启动滚动验证自动选择最优模型。
+- 在“库存优化”页可生成补货建议，并对比自定义服务水平与理论最优的成本差异。
+- 决策建议页展示待办行动清单和库存风险矩阵。
+
+【优化结果】
+- 优化后9个SKU平均预测误差从80.38%降至19.79%。
+- 库存日总成本从113.12元降至45.19元，节约60.05%。
+- 朱迪棒棒糖等IP热点产品节约比例达71.19%以上。
+
+【约束】
+- 只回答与需求预测、库存管理、本系统操作相关的问题。
+- 拒绝回答无关话题（如天气、饮食等）。
+- 回答要清晰、专业、简洁，适当使用列表或分点。
+
+请记住你是小库，用友好热情的语气帮助用户。
+"""
+            messages = [{"role": "system", "content": system_prompt}]
+            for m in st.session_state.xiaoku_msgs[-10:]:
+                messages.append({"role": m["role"], "content": m["content"]})
+            
             # 调用 DeepSeek API（增加超时和重试）
             headers = {
                 "Authorization": f"Bearer {st.session_state.xiaoku_api_key}",
                 "Content-Type": "application/json"
             }
-            messages = [{"role": "system", "content": "你是宠物IP联名产品库存智能决策系统的AI助理“小库”。你只回答与需求预测、库存优化、系统操作相关的问题。回答要专业、简洁。拒绝回答无关话题。"}]
-            for m in st.session_state.xiaoku_msgs[-10:]:
-                messages.append({"role": m["role"], "content": m["content"]})
             payload = {
                 "model": "deepseek-chat",
                 "messages": messages,
@@ -1678,9 +1714,4 @@ elif st.session_state.page == "决策建议":
                     action_df.to_excel(writer, index=False, sheet_name='行动清单')
                 st.download_button("下载订货清单", data=output_excel.getvalue(), file_name="订货清单.xlsx")
         card(show_decision)
-
-
-
-
-
 
