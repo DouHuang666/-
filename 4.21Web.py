@@ -904,14 +904,14 @@ st.sidebar.markdown('<hr>', unsafe_allow_html=True)
 # ========== AI 助手（侧边栏，导航下方，参数面板上方） ==========
 if "xiaoku_msgs" not in st.session_state:
     st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库。我可以解答本系统的指标含义、参数设置、预测模型、库存策略等问题。"}]
-if "xiaoku_api_key" not in st.session_state:
-    st.session_state.xiaoku_api_key = ""
+
+# 优先从 secrets 读取 API Key，如果没有则 session_state 中为空
+if "xiaoku_api_key" not in st.session_state or not st.session_state.xiaoku_api_key:
+    st.session_state.xiaoku_api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
 
 with st.sidebar:
-    # 添加机器人图标样式（不影响其他）
     st.markdown("""
     <style>
-        /* 仅针对 AI 助手 expander 标题中的图标放大 */
         .streamlit-expanderHeader .fa-robot {
             font-size: 1.3rem;
             margin-right: 8px;
@@ -919,34 +919,29 @@ with st.sidebar:
         }
     </style>
     """, unsafe_allow_html=True)
-    # 使用 HTML 在标题中插入 Font Awesome 机器人图标
     with st.expander(" AI 小库 · 智能问答", expanded=False):
-        # 清空对话按钮
         col1, col2 = st.columns([6, 1])
         with col2:
             if st.button("清空", key="clear_chat_btn", help="清空所有对话记录"):
                 st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 对话已清空，有问题随时问我~"}]
                 st.rerun()
-        # 显示历史消息
         for msg in st.session_state.xiaoku_msgs:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
         
-        # 输入框
         user_q = st.chat_input("输入你的问题...", key="xiaoku_chat_input")
-        
         if user_q:
             st.session_state.xiaoku_msgs.append({"role": "user", "content": user_q})
             st.rerun()
         
-        # 处理 AI 回复（当最后一条是用户消息且没有回复时）
         if st.session_state.xiaoku_msgs and st.session_state.xiaoku_msgs[-1]["role"] == "user":
             last_q = st.session_state.xiaoku_msgs[-1]["content"]
             
-            # API Key 处理
+            # 如果没有 API Key，则提示用户配置 secrets 或手动输入
             if not st.session_state.xiaoku_api_key:
-                key_input = st.text_input("🔑 DeepSeek API Key", type="password", placeholder="sk-...", key="temp_key_input")
-                if st.button("保存 Key", key="save_key_btn"):
+                st.info("🔐 未检测到 DeepSeek API Key。请按以下方式配置：\n\n1. 在项目根目录创建 `.streamlit/secrets.toml` 文件，写入：\n   `DEEPSEEK_API_KEY = \"你的密钥\"`\n2. 或者在下方的输入框中临时输入（刷新页面会丢失）")
+                key_input = st.text_input("临时 API Key（刷新丢失）", type="password", placeholder="sk-...", key="temp_key_input")
+                if st.button("使用此 Key", key="use_temp_key"):
                     if key_input.startswith("sk-"):
                         st.session_state.xiaoku_api_key = key_input
                         st.rerun()
@@ -998,7 +993,6 @@ with st.sidebar:
             for m in st.session_state.xiaoku_msgs[-10:]:
                 messages.append({"role": m["role"], "content": m["content"]})
             
-            # 调用 DeepSeek API（增加超时和重试）
             headers = {
                 "Authorization": f"Bearer {st.session_state.xiaoku_api_key}",
                 "Content-Type": "application/json"
