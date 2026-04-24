@@ -8,6 +8,7 @@ from scipy.stats import norm
 from datetime import datetime
 import requests
 import time
+import re
 
 st.set_page_config(page_title="宠物IP联名产品库存智能决策系统", layout="wide", page_icon="🐾")
 
@@ -370,7 +371,6 @@ st.markdown("""
         box-shadow: none !important;
     }
 
-    /* 需求类型胶囊标签 - 细化配色 */
     .badge-demand-trend-up { background: #e0f2fe; color: #0369a1; }
     .badge-demand-trend-down { background: #fee2e2; color: #991b1b; }
     .badge-demand-fluctuation { background: #e5e7eb; color: #374151; }
@@ -548,12 +548,10 @@ st.markdown("""
         color: var(--text-dark) !important;
     }
     
-    /* ========== 确保 AI 助手所有文字为白色（用户和助手消息） ========== */
     .stChatMessage, .stChatMessage p, .stChatMessage div, .stChatMessage span, .stChatMessage strong, .stChatMessage em {
         color: #ffffff !important;
     }
     
-    /* 侧边栏 expander 展开时的标题背景改为青蓝色（保持原有样式） */
     [data-testid="stSidebar"] .stExpander details[open] summary {
         background-color: #2c7da0 !important;
         color: #ffffff !important;
@@ -572,6 +570,94 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+# ========== 内置知识库（基于论文核心内容） ==========
+KNOWLEDGE_CHUNKS = [
+    "本研究聚焦C公司宠物IP联名产品的需求预测与库存订货策略优化。通过构建多维度需求特征指标体系、差异化预测模型体系、成本驱动的库存优化策略，并开发智能决策支持系统，成功将9款核心SKU的平均预测误差率由80.38%降至19.79%。",
+    "需求特征指标包括：需求均值(μ)、需求标准差(σ)、需求变异系数(CV)、平均需求间隔(p)、非零需求均值(μ_NZ)、趋势强度(T)、季节波动系数(F_s)、IP营销波动系数(F_IP)、IP热度系数(H)、最大需求量(D_max)。",
+    "基于决策树的需求分类规则：若p>=1.32且0.4<CV<0.8且μ_NZ<10则为间歇型，若p>=1.32且0.4<CV<0.8且μ_NZ>=10则为平稳型（低频稳定），若p>=1.32且(CV<=0.4或CV>=0.8)则为轻缓波动型。若p<1.32且|T|>0.01且T>0则为趋势增长型，若T<0则为趋势衰退型。若p<1.32且|T|<=0.01且CV>=0.6且(F_s>=1.2或F_IP>=1.4)则为波动型，否则为平稳型。",
+    "预测模型匹配：趋势增长型用霍尔特双参数指数平滑+IP调整；趋势衰退型用简单指数平滑+衰退系数；波动型用季节调整移动平均；平稳型用加权移动平均；间歇型/低频稳定型/轻缓波动型用朴素预测+批量调整。",
+    "报童模型最优服务水平公式：CSL* = B/(B+H*L)，其中B为单位缺货成本，H为单位日持有成本，L为提前期。最优安全库存SS* = z* * σ_d * sqrt(L)。",
+    "补货策略：(T,S)适用于间歇型、低频稳定型、轻缓波动型；(R,Q)适用于平稳型、波动型；(s,S)适用于趋势增长型和趋势衰退型。",
+    "优化后9个SKU平均MAPE从80.38%降至19.79%，库存日总成本从113.12元降至45.19元，节约60.05%。朱迪棒棒糖等IP热点产品节约比例超过70%。"
+]
+
+def retrieve_knowledge(query, top_k=2):
+    """基于关键词匹配检索最相关的知识段落"""
+    words = set(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', query))
+    scores = []
+    for chunk in KNOWLEDGE_CHUNKS:
+        chunk_words = set(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', chunk))
+        common = words & chunk_words
+        score = len(common) / (len(words) + 1e-6)
+        scores.append(score)
+    top_indices = np.argsort(scores)[-top_k:][::-1]
+    retrieved = [KNOWLEDGE_CHUNKS[i] for i in top_indices if scores[i] > 0]
+    return "\n\n".join(retrieved) if retrieved else "（未找到高度相关段落，请参考通用知识）"
+
+# ========== 获取系统当前状态的文本描述 ==========
+def get_system_state_context():
+    """收集当前 session_state 中的数据，生成可供 AI 阅读的上下文"""
+    context = "【当前系统状态】\n"
+    context += f"- 当前页面: {st.session_state.get('page', '概览')}\n"
+    context += f"- 特征是否已计算: {st.session_state.get('features_computed', False)}\n"
+    if st.session_state.get('features_computed') and st.session_state.get('base_df') is not None:
+        df = st.session_state.base_df
+        context += "- 已计算的特征数据（商品简称 | 需求类型 | 均值 | CV | 趋势强度 | 季节系数 | IP系数）:\n"
+        for _, row in df.iterrows():
+            context += f"  {row['商品简称']}: 类型={row['需求类型']}, 均值={row['需求均值μ']:.1f}, CV={row['CV']:.2f}, 趋势={row['趋势强度T']:.2f}, 季节={row['季节系数Fs']:.2f}, IP={row['IP系数F_IP']:.2f}\n"
+    if st.session_state.get('forecast_df') is not None:
+        fdf = st.session_state.forecast_df
+        context += "- 需求预测结果（商品简称 | 使用模型 | 预测销量）:\n"
+        for _, row in fdf.iterrows():
+            context += f"  {row['商品简称']}: 模型={row['使用模型']}, 预测销量={row['预测销量']:.0f}\n"
+    if st.session_state.get('result_df') is not None:
+        rdf = st.session_state.result_df
+        context += "- 库存优化建议（商品简称 | 策略 | 建议补货量 | 优先级）:\n"
+        for _, row in rdf.iterrows():
+            context += f"  {row['商品简称']}: 策略={row['策略']}, 补货量={row['建议补货量']:.0f}, 优先级={row['优先级']}\n"
+    context += "- 可执行的动作指令格式：[ACTION: 动作名 参数]，例如：\n"
+    context += "  * 切换页面：[ACTION: set_page 数据上传]\n"
+    context += "  * 修改参数：[ACTION: set_param period 21]\n"
+    context += "  * 触发按钮：[ACTION: trigger start_forecast] 或 [ACTION: trigger generate_advice]\n"
+    return context
+
+# ========== 执行动作 ==========
+def execute_action(action_str):
+    pattern = r'\[ACTION:\s*(\w+)\s*(.*?)\]'
+    match = re.search(pattern, action_str)
+    if not match:
+        return False
+    action_type = match.group(1).strip()
+    args = match.group(2).strip()
+    
+    if action_type == "set_page":
+        page_name = args
+        if page_name in ["概览", "数据上传", "特征分析", "需求预测", "库存优化", "决策建议"]:
+            st.session_state.page = page_name
+            st.success(f"✅ 已自动切换到页面: {page_name}")
+            return True
+    elif action_type == "set_param":
+        parts = args.split()
+        if len(parts) >= 2:
+            param_name = parts[0]
+            try:
+                param_value = float(parts[1]) if '.' in parts[1] else int(parts[1])
+                st.session_state[param_name] = param_value
+                st.success(f"✅ 已设置参数 {param_name} = {param_value}")
+                return True
+            except:
+                pass
+    elif action_type == "trigger":
+        if args == "start_forecast":
+            st.session_state.trigger_forecast = True
+            st.success("✅ 已触发“开始预测”")
+            return True
+        elif args == "generate_advice":
+            st.session_state.trigger_advice = True
+            st.success("✅ 已触发“生成订货建议”")
+            return True
+    return False
 
 # ========== 辅助函数 ==========
 def render_table(df, add_serial=True):
@@ -872,9 +958,32 @@ if 'daily_df' not in st.session_state:
     st.session_state.ip_days = 7
     st.session_state.non_ip_pos = "开头"
     st.session_state.non_ip_days = 21
+    st.session_state.period = 14
+    st.session_state.alpha = 0.3
+    st.session_state.beta = 0.2
+    st.session_state.ip_cap = 1.8
+    st.session_state.buffer_factor = 2.0
+    st.session_state.batch_mult = 1.2
+    st.session_state.min_order = 30
+    st.session_state.fs_override = 0.0
+    st.session_state.future_no_ip = False
+    st.session_state.persist_factor = 1.0
+    st.session_state.enable_validation = True
+    st.session_state.train_len = 21
+    st.session_state.val_len = 1
+    st.session_state.step = 1
+    st.session_state.show_old_method = True
+    st.session_state.use_cost_opt = True
+    st.session_state.fixed_z = 1.645
+    st.session_state.trend_factor = 1.2
+    st.session_state.intermittent_cycle = 20
+    st.session_state.ordering_cost_K = 100.0
+    st.session_state.user_service_level = 0.95
     st.session_state.manual_model_dict = {}
+    st.session_state.trigger_forecast = False
+    st.session_state.trigger_advice = False
 
-# ========== 主页面顶部品牌区 ==========
+# 顶部品牌区
 st.markdown(f"""
 <div class="top-brand">
     <div>
@@ -887,13 +996,10 @@ st.markdown(f"""
 
 # ========== 侧边栏导航 ==========
 st.sidebar.markdown('<div class="sidebar-nav-title"><h3><i class="fas fa-compass" style="margin-right: 8px;"></i> 导航</h3></div>', unsafe_allow_html=True)
-
 nav_options = ["概览", "数据上传", "特征分析", "需求预测", "库存优化", "决策建议"]
 current_page = st.session_state.page
-
 def set_page(page_name):
     st.session_state.page = page_name
-
 for option in nav_options:
     if option == current_page:
         st.sidebar.button(option, key=f"nav_{option}", use_container_width=True, type="primary", on_click=set_page, args=(option,))
@@ -901,140 +1007,84 @@ for option in nav_options:
         st.sidebar.button(option, key=f"nav_{option}", use_container_width=True, on_click=set_page, args=(option,))
 
 st.sidebar.markdown('<hr>', unsafe_allow_html=True)
-# ========== AI 助手（侧边栏，导航下方，参数面板上方） ==========
-if "xiaoku_msgs" not in st.session_state:
-    st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库。我可以解答本系统的指标含义、参数设置、预测模型、库存策略等问题。"}]
 
-# 优先从 secrets 读取 API Key，如果没有则 session_state 中为空
-if "xiaoku_api_key" not in st.session_state or not st.session_state.xiaoku_api_key:
-    st.session_state.xiaoku_api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
+# ========== AI 小库（侧边栏） ==========
+if "xiaoku_msgs" not in st.session_state:
+    st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库，已接入论文知识库和系统实时数据。我可以帮你分析需求特征、预测销量、优化库存，还能自动切换页面或设置参数。有什么我能帮你的吗？"}]
+if "xiaoku_api_key" not in st.session_state:
+    try:
+        st.session_state.xiaoku_api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
+    except Exception:
+        st.session_state.xiaoku_api_key = ""
 
 with st.sidebar:
-    st.markdown("""
-    <style>
-        .streamlit-expanderHeader .fa-robot {
-            font-size: 1.3rem;
-            margin-right: 8px;
-            vertical-align: middle;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-    with st.expander(" AI 小库 · 智能问答", expanded=False):
-        col1, col2 = st.columns([6, 1])
+    with st.expander("🤖 AI 小库 · 智能问答（可控制系统）", expanded=False):
+        col1, col2 = st.columns([6,1])
         with col2:
-            if st.button("清空", key="clear_chat_btn", help="清空所有对话记录"):
+            if st.button("清空", key="clear_chat"):
                 st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 对话已清空，有问题随时问我~"}]
                 st.rerun()
         for msg in st.session_state.xiaoku_msgs:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-        
-        user_q = st.chat_input("输入你的问题...", key="xiaoku_chat_input")
+        user_q = st.chat_input("输入你的问题，例如：帮我切换到库存优化页面，或者分析朱迪棒棒糖的需求类型", key="xiaoku_chat_input")
         if user_q:
             st.session_state.xiaoku_msgs.append({"role": "user", "content": user_q})
             st.rerun()
         
         if st.session_state.xiaoku_msgs and st.session_state.xiaoku_msgs[-1]["role"] == "user":
             last_q = st.session_state.xiaoku_msgs[-1]["content"]
-            
-            # 如果没有 API Key，则提示用户配置 secrets 或手动输入
             if not st.session_state.xiaoku_api_key:
-                st.info("🔐 未检测到 DeepSeek API Key。请按以下方式配置：\n\n1. 在项目根目录创建 `.streamlit/secrets.toml` 文件，写入：\n   `DEEPSEEK_API_KEY = \"你的密钥\"`\n2. 或者在下方的输入框中临时输入（刷新页面会丢失）")
-                key_input = st.text_input("临时 API Key（刷新丢失）", type="password", placeholder="sk-...", key="temp_key_input")
-                if st.button("使用此 Key", key="use_temp_key"):
+                st.info("🔐 未检测到 DeepSeek API Key，请在 .streamlit/secrets.toml 中配置 DEEPSEEK_API_KEY")
+                key_input = st.text_input("临时 API Key（刷新丢失）", type="password", key="temp_key")
+                if st.button("使用此Key", key="use_temp"):
                     if key_input.startswith("sk-"):
                         st.session_state.xiaoku_api_key = key_input
                         st.rerun()
-                    else:
-                        st.error("Key 格式错误，应以 sk- 开头")
                 st.stop()
             
-            # 增强版系统提示词（融入论文知识）
-            system_prompt = """
-你是宠物IP联名产品库存智能决策系统的AI助理“小库”。你的知识库包含以下论文核心内容：
+            retrieved = retrieve_knowledge(last_q, top_k=2)
+            system_state = get_system_state_context()
+            system_prompt = f"""
+你是宠物IP联名产品库存智能决策系统AI助理“小库”。你有以下能力：
+- 基于论文知识库回答专业问题（论文核心内容：需求特征分类、预测模型、报童模型、差异化补货策略等）。
+- 感知系统当前所有数据（特征分析、预测结果、库存建议等）。
+- 控制系统组件（切换页面、修改参数、触发按钮），通过输出 [ACTION: 动作名 参数] 实现。
 
-【系统背景】
-本系统专为C公司宠物IP联名产品设计，集成了数据上传、需求特征分析、需求类型自动划分、6种预测模型（加权移动平均、霍尔特双参数+IP调整、季节调整移动平均、基础平稳+IP缓冲、简单指数平滑+衰退系数、朴素预测+批量调整）、滚动窗口交叉验证自动选模、报童模型最优安全库存、差异化补货策略((T,S)/(R,Q)/(s,S))、库存风险可视化等功能。
+【论文知识库相关片段】
+{retrieved}
 
-【核心指标解释】
-- CV (需求变异系数) = 标准差/均值，CV≥0.6表示高波动。
-- 平均需求间隔 p = 总天数/非零需求天数，p≥1.32为间歇型。
-- 趋势强度 T = (最近3期平均 - 最早3期平均)/最早3期平均，|T|>0.01视为有趋势。
-- 季节系数 Fs = 旺季销量/淡季销量，≥1.2有明显季节波动。
-- IP营销波动系数 F_IP = IP营销月销量/非营销月销量，用于放大预测。
-- 报童模型：最优服务水平 = B/(B+H*L)，B为缺货成本，H为日持有成本，L为提前期。
-- 补货策略：(T,S)固定周期补货；(R,Q)连续检查订货点批量；(s,S)连续检查补至目标库存。
+{system_state}
 
-【参数设置建议】
-- 平滑系数α、β：默认0.3、0.2，需求稳定可降低，波动大可提高。
-- 趋势放大系数：增长型需求建议1.2~1.5。
-- IP调整上限：默认1.8，避免过度放大。
-- 自定义服务水平：提高会增加安全库存和持有成本，系统会显示与理论最优的差额。
-
-【系统操作说明】
-- 上传销售数据和库存数据后，系统自动计算特征并分类。
-- 在“需求预测”页可启动滚动验证自动选择最优模型。
-- 在“库存优化”页可生成补货建议，并对比自定义服务水平与理论最优的成本差异。
-- 决策建议页展示待办行动清单和库存风险矩阵。
-
-【优化结果】
-- 优化后9个SKU平均预测误差从80.38%降至19.79%。
-- 库存日总成本从113.12元降至45.19元，节约60.05%。
-- 朱迪棒棒糖等IP热点产品节约比例达71.19%以上。
-
-【约束】
-- 只回答与需求预测、库存管理、本系统操作相关的问题。
-- 拒绝回答无关话题（如天气、饮食等）。
-- 回答要清晰、专业、简洁，适当使用列表或分点。
-
-请记住你是小库，用友好热情的语气帮助用户。
+【回复要求】
+1. 先基于知识库和系统数据回答用户问题。
+2. 如果用户要求执行操作（例如“切换到数据上传页面”“把预测天数改成21”“开始预测”），请在回答末尾加上对应的 [ACTION: ...] 指令。
+3. 动作指令格式：
+   - 切换页面: [ACTION: set_page 页面名]   （页面名可选：概览,数据上传,特征分析,需求预测,库存优化,决策建议）
+   - 修改参数: [ACTION: set_param 参数名 数值]  （参数名如 period, alpha, trend_factor 等）
+   - 触发按钮: [ACTION: trigger start_forecast]  或 [ACTION: trigger generate_advice]
+4. 保持语气友好、专业。
 """
             messages = [{"role": "system", "content": system_prompt}]
-            for m in st.session_state.xiaoku_msgs[-10:]:
+            for m in st.session_state.xiaoku_msgs[-8:]:
                 messages.append({"role": m["role"], "content": m["content"]})
-            
-            headers = {
-                "Authorization": f"Bearer {st.session_state.xiaoku_api_key}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "deepseek-chat",
-                "messages": messages,
-                "stream": False,
-                "temperature": 0.7,
-                "max_tokens": 800
-            }
-            
-            max_retries = 2
-            retry_delay = 2
-            reply = None
-            for attempt in range(max_retries + 1):
-                try:
-                    with st.spinner("思考中..."):
-                        resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
-                        if resp.status_code == 200:
-                            reply = resp.json()["choices"][0]["message"]["content"]
-                            break
-                        else:
-                            reply = f"❌ API 错误 ({resp.status_code}): {resp.text}"
-                            break
-                except requests.exceptions.Timeout:
-                    if attempt < max_retries:
-                        time.sleep(retry_delay)
-                        continue
-                    else:
-                        reply = "❌ 请求超时，请稍后重试（DeepSeek 服务可能繁忙）。"
-                except Exception as e:
-                    reply = f"❌ 请求失败: {str(e)}"
-                    break
-            
-            if reply is None:
-                reply = "❌ 多次重试后仍失败，请检查网络或稍后再试。"
-            
-            st.session_state.xiaoku_msgs.append({"role": "assistant", "content": reply})
+            headers = {"Authorization": f"Bearer {st.session_state.xiaoku_api_key}", "Content-Type": "application/json"}
+            payload = {"model": "deepseek-chat", "messages": messages, "stream": False, "temperature": 0.7, "max_tokens": 1000}
+            try:
+                with st.spinner("小库思考中..."):
+                    resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
+                if resp.status_code == 200:
+                    reply = resp.json()["choices"][0]["message"]["content"]
+                    if "[ACTION:" in reply:
+                        execute_action(reply)
+                    st.session_state.xiaoku_msgs.append({"role": "assistant", "content": reply})
+                else:
+                    st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ API错误: {resp.status_code}"})
+            except Exception as e:
+                st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ 请求失败: {str(e)}"})
             st.rerun()
 
-# ========== 动态参数面板 ==========
+# ========== 动态参数面板（侧边栏） ==========
 if st.session_state.page == "数据上传":
     with st.sidebar.expander("⚙️ 特征计算参数", expanded=False):
         param_with_help(lambda: setattr(st.session_state, 'season_pos', st.selectbox("旺季位置", ["末尾", "开头"], index=1)), "选择旺季数据在时间窗口的末尾或开头")
@@ -1125,7 +1175,6 @@ if st.session_state.page == "概览":
         """, unsafe_allow_html=True)
 
     st.markdown("---")
-    
     st.markdown("<h3><i class='fas fa-rocket' style='margin-right: 8px;'></i> 快速开始</h3>", unsafe_allow_html=True)
     step_cols = st.columns(4)
     steps = [
@@ -1144,7 +1193,6 @@ if st.session_state.page == "概览":
             """, unsafe_allow_html=True)
     
     st.markdown("---")
-    
     st.markdown("<h3><i class='fas fa-table' style='margin-right: 8px;'></i> 数据示例预览</h3>", unsafe_allow_html=True)
     if st.session_state.features_computed and st.session_state.daily_df is not None:
         st.markdown("**最新销售数据（近5天）**")
@@ -1165,7 +1213,6 @@ if st.session_state.page == "概览":
         """, unsafe_allow_html=True)
     
     st.markdown("---")
-    
     st.markdown("<h3><i class='fas fa-star' style='margin-right: 8px;'></i> 系统亮点</h3>", unsafe_allow_html=True)
     highlight_cols = st.columns(3)
     highlights = [
@@ -1275,12 +1322,10 @@ elif st.session_state.page == "特征分析":
         selected_sku = st.selectbox("选择SKU", sku_list, format_func=lambda x: base_df[base_df['商品名称']==x]['商品简称'].iloc[0])
         if selected_sku:
             row = base_df[base_df['商品名称'] == selected_sku].iloc[0]
-            
             categories = ['需求均值', 'CV', '趋势强度', '季节系数', 'IP系数']
             values = [row['需求均值μ'], row['CV'], row['趋势强度T'], row['季节系数Fs'], row['IP系数F_IP']]
             max_vals = [max(base_df['需求均值μ']), max(base_df['CV']), max(abs(base_df['趋势强度T'])), max(base_df['季节系数Fs']), max(base_df['IP系数F_IP'])]
             normalized = [values[i]/max_vals[i] if max_vals[i]!=0 else 0 for i in range(5)]
-            
             fig = go.Figure()
             fig.add_trace(go.Scatterpolar(
                 r=normalized,
@@ -1309,7 +1354,6 @@ elif st.session_state.page == "特征分析":
                 margin=dict(l=40, r=40, t=40, b=20),
                 showlegend=False
             )
-            
             col_left, col_right = st.columns([1.2, 0.8])
             with col_left:
                 st.plotly_chart(fig, use_container_width=True)
@@ -1324,7 +1368,6 @@ elif st.session_state.page == "特征分析":
                     <div class="feature-card"><div class="feature-icon"><i class="fas fa-percent"></i></div><div class="feature-label">零需求占比</div><div class="feature-value">{row['零需求占比']*100:.1f}%</div></div>
                 </div>
                 """, unsafe_allow_html=True)
-                
                 dtype = row['需求类型']
                 if '趋势型需求（增长）' in dtype:
                     badge_class = "badge-demand-trend-up"
@@ -1350,7 +1393,6 @@ elif st.session_state.page == "特征分析":
                     <div class="demand-type-value"><span class="badge {badge_class}" style="font-size: 1rem;">{icon} {dtype}</span></div>
                 </div>
                 """, unsafe_allow_html=True)
-            
             st.markdown("<h3>需求特征指标</h3>", unsafe_allow_html=True)
             display_cols = {
                 '商品简称': '商品简称',
@@ -1407,7 +1449,11 @@ elif st.session_state.page == "需求预测":
         model_list = ["加权移动平均", "霍尔特双参数+IP调整", "季节调整移动平均",
                       "基础平稳+IP缓冲", "简单指数平滑+衰退系数", "朴素预测+批量调整"]
 
-        if st.button("开始预测", type="primary"):
+        # 开始预测按钮 + 触发标志
+        col_btn1, col_btn2 = st.columns([1,4])
+        with col_btn1:
+            start_click = st.button("开始预测", type="primary")
+        if start_click or st.session_state.pop("trigger_forecast", False):
             with st.spinner("正在执行滚动验证和预测，请稍候..."):
                 best_models = {}
                 if enable_validation and train_len + val_len <= total_days:
@@ -1536,7 +1582,8 @@ elif st.session_state.page == "库存优化":
             'safety_cycle': 14,
             'K': ordering_cost_K
         }
-        if st.button("生成订货建议", type="primary"):
+        # 按钮 + 触发标志
+        if st.button("生成订货建议", type="primary") or st.session_state.pop("trigger_advice", False):
             with st.spinner("正在计算最优订货建议..."):
                 advice_opt = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=None), axis=1)
                 advice_user = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=user_service_level), axis=1)
@@ -1562,7 +1609,6 @@ elif st.session_state.page == "库存优化":
                     <div class="param-item"><div class="param-label"><i class="fas fa-percent"></i> 服务水平</div><div class="param-value">{user_service_level*100:.0f}%</div></div>
                 </div>
                 """, unsafe_allow_html=True)
-                
                 st.markdown("<h3>智能订货建议</h3>", unsafe_allow_html=True)
                 display_df = result_df[['商品简称', '需求类型', '策略', '安全库存', '订货点', '目标库存', '建议补货量', '优先级',
                                         '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '成本增加额(元/天)', '成本增加(%)']].copy()
@@ -1570,7 +1616,6 @@ elif st.session_state.page == "库存优化":
                     if col in display_df.columns:
                         display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
                 render_table(display_df, add_serial=True)
-                
                 st.markdown("<h3>💰 自定义服务水平与理论最优的成本对比</h3>", unsafe_allow_html=True)
                 col1, col2 = st.columns(2)
                 with col1:
@@ -1592,13 +1637,11 @@ elif st.session_state.page == "库存优化":
                         <div class="cost-value">¥{best_saving:.2f} / ¥{worst_extra:.2f}</div>
                     </div>
                     """, unsafe_allow_html=True)
-                
                 cost_table = result_df[['商品简称', '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)', '成本增加(%)']].copy()
                 for col in ['用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)']:
                     if col in cost_table.columns:
                         cost_table[col] = cost_table[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
                 render_table(cost_table, add_serial=True)
-                
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     result_df.to_excel(writer, index=False, sheet_name='订货建议')
@@ -1708,4 +1751,3 @@ elif st.session_state.page == "决策建议":
                     action_df.to_excel(writer, index=False, sheet_name='行动清单')
                 st.download_button("下载订货清单", data=output_excel.getvalue(), file_name="订货清单.xlsx")
         card(show_decision)
-
