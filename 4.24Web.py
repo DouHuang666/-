@@ -14,7 +14,7 @@ st.set_page_config(page_title="宠物IP联名产品库存智能决策系统", la
 
 st.markdown('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">', unsafe_allow_html=True)
 
-# ========== CSS ==========
+# ========== CSS（与您的原文件完全相同） ==========
 st.markdown("""
 <style>
     :root {
@@ -595,7 +595,7 @@ def retrieve_knowledge(query, top_k=2):
     retrieved = [KNOWLEDGE_CHUNKS[i] for i in top_indices if scores[i] > 0]
     return "\n\n".join(retrieved) if retrieved else "（未找到高度相关段落，请参考通用知识）"
 
-# ========== 获取系统当前状态的文本描述 ==========
+# ========== 获取系统当前状态的文本描述（已移除动作指令说明） ==========
 def get_system_state_context():
     """收集当前 session_state 中的数据，生成可供 AI 阅读的上下文"""
     context = "【当前系统状态】\n"
@@ -616,50 +616,10 @@ def get_system_state_context():
         context += "- 库存优化建议（商品简称 | 策略 | 建议补货量 | 优先级）:\n"
         for _, row in rdf.iterrows():
             context += f"  {row['商品简称']}: 策略={row['策略']}, 补货量={row['建议补货量']:.0f}, 优先级={row['优先级']}\n"
-    context += "- 可执行的动作指令格式：[ACTION: 动作名 参数]，例如：\n"
-    context += "  * 切换页面：[ACTION: set_page 数据上传]\n"
-    context += "  * 修改参数：[ACTION: set_param period 21]\n"
-    context += "  * 触发按钮：[ACTION: trigger start_forecast] 或 [ACTION: trigger generate_advice]\n"
+    # 不再包含动作指令说明
     return context
 
-# ========== 执行动作 ==========
-def execute_action(action_str):
-    pattern = r'\[ACTION:\s*(\w+)\s*(.*?)\]'
-    match = re.search(pattern, action_str)
-    if not match:
-        return False
-    action_type = match.group(1).strip()
-    args = match.group(2).strip()
-    
-    if action_type == "set_page":
-        page_name = args
-        if page_name in ["概览", "数据上传", "特征分析", "需求预测", "库存优化", "决策建议"]:
-            st.session_state.page = page_name
-            st.success(f"✅ 已自动切换到页面: {page_name}")
-            return True
-    elif action_type == "set_param":
-        parts = args.split()
-        if len(parts) >= 2:
-            param_name = parts[0]
-            try:
-                param_value = float(parts[1]) if '.' in parts[1] else int(parts[1])
-                st.session_state[param_name] = param_value
-                st.success(f"✅ 已设置参数 {param_name} = {param_value}")
-                return True
-            except:
-                pass
-    elif action_type == "trigger":
-        if args == "start_forecast":
-            st.session_state.trigger_forecast = True
-            st.success("✅ 已触发“开始预测”")
-            return True
-        elif args == "generate_advice":
-            st.session_state.trigger_advice = True
-            st.success("✅ 已触发“生成订货建议”")
-            return True
-    return False
-
-# ========== 辅助函数 ==========
+# ========== 辅助函数（保持不变） ==========
 def render_table(df, add_serial=True):
     df_copy = df.copy()
     if add_serial:
@@ -801,7 +761,7 @@ def card(content_func):
     content_func()
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ========== 业务函数 ==========
+# ========== 业务函数（保持不变） ==========
 def classify_demand_type(row):
     p = row['平均需求间隔p']; t = row['趋势强度T']; cv = row['CV']; fs = row['季节系数Fs']; f_ip = row['IP系数F_IP']; mu_nz = row.get('非零需求均值', row['需求均值μ'])
     if any(pd.isna(x) for x in [p, t, cv, fs, f_ip, mu_nz]): return '特征缺失'
@@ -1008,9 +968,9 @@ for option in nav_options:
 
 st.sidebar.markdown('<hr>', unsafe_allow_html=True)
 
-# ========== AI 小库（侧边栏） ==========
+# ========== AI 小库（侧边栏）- 仅问答，无控制功能 ==========
 if "xiaoku_msgs" not in st.session_state:
-    st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库，已接入论文知识库和系统实时数据。我可以帮你分析需求特征、预测销量、优化库存，还能自动切换页面或设置参数。有什么我能帮你的吗？"}]
+    st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库，已接入论文知识库和系统实时数据。我可以帮你分析需求特征、预测销量、优化库存等相关问题。有什么我能帮你的吗？"}]
 if "xiaoku_api_key" not in st.session_state:
     try:
         st.session_state.xiaoku_api_key = st.secrets.get("DEEPSEEK_API_KEY", "")
@@ -1018,7 +978,7 @@ if "xiaoku_api_key" not in st.session_state:
         st.session_state.xiaoku_api_key = ""
 
 with st.sidebar:
-    with st.expander("🤖 AI 小库 · 智能问答（可控制系统）", expanded=False):
+    with st.expander("🤖 AI 小库 · 智能问答", expanded=False):
         col1, col2 = st.columns([6,1])
         with col2:
             if st.button("清空", key="clear_chat"):
@@ -1027,7 +987,7 @@ with st.sidebar:
         for msg in st.session_state.xiaoku_msgs:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-        user_q = st.chat_input("输入你的问题，例如：帮我切换到库存优化页面，或者分析朱迪棒棒糖的需求类型", key="xiaoku_chat_input")
+        user_q = st.chat_input("输入你的问题，例如：分析朱迪棒棒糖的需求类型，或者解释报童模型", key="xiaoku_chat_input")
         if user_q:
             st.session_state.xiaoku_msgs.append({"role": "user", "content": user_q})
             st.rerun()
@@ -1046,10 +1006,9 @@ with st.sidebar:
             retrieved = retrieve_knowledge(last_q, top_k=2)
             system_state = get_system_state_context()
             system_prompt = f"""
-你是宠物IP联名产品库存智能决策系统AI助理“小库”。你有以下能力：
+你是宠物IP联名产品库存智能决策系统AI助理“小库”。你的能力：
 - 基于论文知识库回答专业问题（论文核心内容：需求特征分类、预测模型、报童模型、差异化补货策略等）。
 - 感知系统当前所有数据（特征分析、预测结果、库存建议等）。
-- 控制系统组件（切换页面、修改参数、触发按钮），通过输出 [ACTION: 动作名 参数] 实现。
 
 【论文知识库相关片段】
 {retrieved}
@@ -1057,13 +1016,9 @@ with st.sidebar:
 {system_state}
 
 【回复要求】
-1. 先基于知识库和系统数据回答用户问题。
-2. 如果用户要求执行操作（例如“切换到数据上传页面”“把预测天数改成21”“开始预测”），请在回答末尾加上对应的 [ACTION: ...] 指令。
-3. 动作指令格式：
-   - 切换页面: [ACTION: set_page 页面名]   （页面名可选：概览,数据上传,特征分析,需求预测,库存优化,决策建议）
-   - 修改参数: [ACTION: set_param 参数名 数值]  （参数名如 period, alpha, trend_factor 等）
-   - 触发按钮: [ACTION: trigger start_forecast]  或 [ACTION: trigger generate_advice]
-4. 保持语气友好、专业。
+1. 仅基于知识库和系统数据回答用户问题，不要尝试执行任何操作（不要切换页面、修改参数、触发按钮）。
+2. 如果用户要求控制系统（如“切换页面”“修改参数”“开始预测”），请礼貌告知此类操作需要手动完成。
+3. 回答清晰、专业、简洁。
 """
             messages = [{"role": "system", "content": system_prompt}]
             for m in st.session_state.xiaoku_msgs[-8:]:
@@ -1075,8 +1030,7 @@ with st.sidebar:
                     resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
                 if resp.status_code == 200:
                     reply = resp.json()["choices"][0]["message"]["content"]
-                    if "[ACTION:" in reply:
-                        execute_action(reply)
+                    # 不再调用 execute_action
                     st.session_state.xiaoku_msgs.append({"role": "assistant", "content": reply})
                 else:
                     st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ API错误: {resp.status_code}"})
@@ -1084,7 +1038,7 @@ with st.sidebar:
                 st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ 请求失败: {str(e)}"})
             st.rerun()
 
-# ========== 动态参数面板（侧边栏） ==========
+# ========== 动态参数面板（侧边栏）- 保持原有 setattr 方式 ==========
 if st.session_state.page == "数据上传":
     with st.sidebar.expander("⚙️ 特征计算参数", expanded=False):
         param_with_help(lambda: setattr(st.session_state, 'season_pos', st.selectbox("旺季位置", ["末尾", "开头"], index=1)), "选择旺季数据在时间窗口的末尾或开头")
