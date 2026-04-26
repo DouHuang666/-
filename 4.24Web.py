@@ -577,7 +577,7 @@ KNOWLEDGE_CHUNKS = [
     "需求特征指标包括：需求均值(μ)、需求标准差(σ)、需求变异系数(CV)、平均需求间隔(p)、非零需求均值(μ_NZ)、趋势强度(T)、季节波动系数(F_s)、IP营销波动系数(F_IP)、IP热度系数(H)、最大需求量(D_max)。",
     "基于决策树的需求分类规则：若p>=1.32且0.4<CV<0.8且μ_NZ<10则为间歇型，若p>=1.32且0.4<CV<0.8且μ_NZ>=10则为平稳型（低频稳定），若p>=1.32且(CV<=0.4或CV>=0.8)则为轻缓波动型。若p<1.32且|T|>0.01且T>0则为趋势增长型，若T<0则为趋势衰退型。若p<1.32且|T|<=0.01且CV>=0.6且(F_s>=1.2或F_IP>=1.4)则为波动型，否则为平稳型。",
     "预测模型匹配：趋势增长型用霍尔特双参数指数平滑+IP调整；趋势衰退型用简单指数平滑+衰退系数；波动型用季节调整移动平均；平稳型用加权移动平均；间歇型/低频稳定型/轻缓波动型用朴素预测+批量调整。",
-    "报童模型最优服务水平公式：CSL* = B/(B+H*L)，其中B为单位缺货成本，H为单位日持有成本，L为提前期。最优安全库存SS* = z* * σ_d * sqrt(L)。",
+    "最优服务水平公式（基于成本平衡）：CSL* = B/(B+H*L)，其中B为单位缺货成本，H为单位日持有成本，L为提前期。最优安全库存SS* = z* * σ_d * sqrt(L)。",
     "补货策略：(T,S)适用于间歇型、低频稳定型、轻缓波动型；(R,Q)适用于平稳型、波动型；(s,S)适用于趋势增长型和趋势衰退型。",
     "优化后9个SKU平均MAPE从80.38%降至19.79%，库存日总成本从113.12元降至45.19元，节约60.05%。朱迪棒棒糖等IP热点产品节约比例超过70%。"
 ]
@@ -595,7 +595,7 @@ def retrieve_knowledge(query, top_k=2):
     retrieved = [KNOWLEDGE_CHUNKS[i] for i in top_indices if scores[i] > 0]
     return "\n\n".join(retrieved) if retrieved else "（未找到高度相关段落，请参考通用知识）"
 
-# ========== 获取系统当前状态的文本描述（已移除动作指令说明） ==========
+# ========== 获取系统当前状态的文本描述 ==========
 def get_system_state_context():
     """收集当前 session_state 中的数据，生成可供 AI 阅读的上下文"""
     context = "【当前系统状态】\n"
@@ -618,7 +618,7 @@ def get_system_state_context():
             context += f"  {row['商品简称']}: 策略={row['策略']}, 补货量={row['建议补货量']:.0f}, 优先级={row['优先级']}\n"
     return context
 
-# ========== 辅助函数（保持不变） ==========
+# ========== 辅助函数 ==========
 def render_table(df, add_serial=True):
     df_copy = df.copy()
     if add_serial:
@@ -854,7 +854,7 @@ def predict_sku_with_model(train_series, model_type, forecast_days, params, feat
 
 # ========== 新库存成本模型（基于论文第四章式4-8） ==========
 def compute_inventory_advice(row, period_days, params, service_level_override=None):
-    """基于论文第四章新模型（包含持有、缺货、订货成本）计算库存优化建议。返回字段与原系统完全一致。"""
+    """基于成本优化模型（持有、缺货、订货成本）计算库存优化建议。返回字段与原系统完全一致。"""
     dtype = row['需求类型']
     mu_d = row['预测销量'] / period_days
     sigma_d = row['需求标准差σ']
@@ -1050,7 +1050,7 @@ with st.sidebar:
         for msg in st.session_state.xiaoku_msgs:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-        user_q = st.chat_input("输入你的问题，例如：分析朱迪棒棒糖的需求类型，或者解释报童模型", key="xiaoku_chat_input")
+        user_q = st.chat_input("输入你的问题，例如：分析朱迪棒棒糖的需求类型，或者解释成本优化模型", key="xiaoku_chat_input")
         if user_q:
             st.session_state.xiaoku_msgs.append({"role": "user", "content": user_q})
             st.rerun()
@@ -1070,7 +1070,7 @@ with st.sidebar:
             system_state = get_system_state_context()
             system_prompt = f"""
 你是宠物IP联名产品库存智能决策系统AI助理“小库”。你的能力：
-- 基于论文知识库回答专业问题（论文核心内容：需求特征分类、预测模型、报童模型、差异化补货策略等）。
+- 基于论文知识库回答专业问题（论文核心内容：需求特征分类、预测模型、成本优化模型、差异化补货策略等）。
 - 感知系统当前所有数据（特征分析、预测结果、库存建议等）。
 
 【论文知识库相关片段】
@@ -1141,7 +1141,7 @@ elif st.session_state.page == "需求预测":
             param_with_help(lambda: setattr(st.session_state, 'show_old_method', st.checkbox("计算旧方法MAD", value=True)), "同时计算简单平均法的MAD作为对比")
 elif st.session_state.page == "库存优化":
     with st.sidebar.expander("📦 库存策略参数", expanded=False):
-        param_with_help(lambda: setattr(st.session_state, 'use_cost_opt', st.checkbox("启用报童模型优化", value=True)), "根据缺货成本与仓储成本自动优化服务水平")
+        param_with_help(lambda: setattr(st.session_state, 'use_cost_opt', st.checkbox("启用成本驱动服务水平优化", value=True)), "根据缺货成本与仓储成本自动优化服务水平")
         if not st.session_state.use_cost_opt:
             param_with_help(lambda: setattr(st.session_state, 'fixed_z', st.number_input("固定z值", 1.0, 3.0, 1.645, 0.05)), "手动设置安全库存系数（z分数）")
         param_with_help(lambda: setattr(st.session_state, 'trend_factor', st.slider("趋势放大系数", 0.5, 2.0, 1.2, 0.05)), "考虑需求增长时放大目标库存")
@@ -1151,11 +1151,10 @@ elif st.session_state.page == "库存优化":
 
 # ========== 页面内容 ==========
 if st.session_state.page == "概览":
-    # ...（完全相同，略）...
     st.markdown("""
     <div class="hero-banner">
         <h1><i class="fas fa-paw" style="margin-right: 10px;"></i> 宠物IP联名产品库存决策系统</h1>
-        <p>专为IP联名宠物产品设计的智能库存管理工具，集成需求特征分析、多模型预测、报童优化与差异补货策略</p>
+        <p>专为IP联名宠物产品设计的智能库存管理工具，集成需求特征分析、多模型预测、成本优化与差异补货策略</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -1187,7 +1186,7 @@ if st.session_state.page == "概览":
         <div class="metric-card" style="min-height: 160px; display: flex; flex-direction: column; justify-content: center;">
             <div class="metric-value"><i class="fas fa-boxes"></i></div>
             <div class="metric-label">智能库存优化</div>
-            <small style="color: #1f6e8c;">报童模型自动寻优、差异化补货策略、(R,Q)/(s,S)/(T,S)策略</small>
+            <small style="color: #1f6e8c;">成本优化模型自动寻优、差异化补货策略、(R,Q)/(s,S)/(T,S)策略</small>
         </div>
         """, unsafe_allow_html=True)
 
@@ -1235,7 +1234,7 @@ if st.session_state.page == "概览":
     highlights = [
         ("<i class='fas fa-target'></i> 精准分类", "基于5维特征（CV、趋势、季节、IP、间隔）自动划分需求类型"),
         ("<i class='fas fa-sliders-h'></i> 模型自选", "滚动窗口MAD对比 + 手动覆盖，灵活选择预测模型"),
-        ("<i class='fas fa-chart-line'></i> 成本优化", "报童模型动态计算最优服务水平，量化自定义服务水平成本增幅")
+        ("<i class='fas fa-chart-line'></i> 成本优化", "成本驱动模型动态计算最优服务水平，量化自定义服务水平成本增幅")
     ]
     for i, col in enumerate(highlight_cols):
         with col:
