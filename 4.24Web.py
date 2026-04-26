@@ -616,7 +616,6 @@ def get_system_state_context():
         context += "- 库存优化建议（商品简称 | 策略 | 建议补货量 | 优先级）:\n"
         for _, row in rdf.iterrows():
             context += f"  {row['商品简称']}: 策略={row['策略']}, 补货量={row['建议补货量']:.0f}, 优先级={row['优先级']}\n"
-    # 不再包含动作指令说明
     return context
 
 # ========== 辅助函数（保持不变） ==========
@@ -761,7 +760,7 @@ def card(content_func):
     content_func()
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ========== 业务函数（保持不变） ==========
+# ========== 业务函数 ==========
 def classify_demand_type(row):
     p = row['平均需求间隔p']; t = row['趋势强度T']; cv = row['CV']; fs = row['季节系数Fs']; f_ip = row['IP系数F_IP']; mu_nz = row.get('非零需求均值', row['需求均值μ'])
     if any(pd.isna(x) for x in [p, t, cv, fs, f_ip, mu_nz]): return '特征缺失'
@@ -853,43 +852,107 @@ def predict_sku_with_model(train_series, model_type, forecast_days, params, feat
         return batch * weeks
     else: return mu * forecast_days
 
+# ========== 新库存成本模型（基于论文第四章式4-8） ==========
 def compute_inventory_advice(row, period_days, params, service_level_override=None):
-    dtype = row['需求类型']; mu_d = row['预测销量'] / period_days; sigma_d = row['需求标准差σ']; L = row['提前期']
-    cur_stock = row['当前总库存']; P = row['采购价']; R = row['零售价']; theta = row['缺货成本']; C_w = row['仓储成本']; r = row['资金占用成本']
-    B = R * theta; H = (P * r + C_w * 12) / 365
+    """基于论文第四章新模型（包含持有、缺货、订货成本）计算库存优化建议。返回字段与原系统完全一致。"""
+    dtype = row['需求类型']
+    mu_d = row['预测销量'] / period_days
+    sigma_d = row['需求标准差σ']
+    L = row['提前期']
+    cur_stock = row['当前总库存']
+    P = row['采购价']
+    R_price = row['零售价']
+    theta = row['缺货成本']
+    C_w = row['仓储成本']
+    r = row['资金占用成本']
+
+    # 单位日持有成本 H 和单位缺货成本 B
+    H = (P * r + C_w * 12) / 365
+    B = R_price * theta
+
+    # 损失函数 G(z) = φ(z) - z*(1-Φ(z))
+    def loss(z):
+        return norm.pdf(z) - z * (1 - norm.cdf(z))
+
+    # 确定安全系数 z_opt 与服务水平
     if service_level_override is not None:
-        CSL = service_level_override; z_opt = norm.ppf(CSL)
+        CSL = service_level_override
+        z_opt = norm.ppf(CSL)
     else:
-        if params['use_cost_optimization']: z_opt = compute_optimal_z(B, H, L)
-        else: z_opt = params['fixed_z']
-        CSL = norm.cdf(z_opt)
+        if params.get('use_cost_optimization', False):
+            alpha = B / (B + H * L) if (B + H * L) > 0 else 0.5
+            alpha = max(0.001, min(0.999, alpha))
+            z_opt = norm.ppf(alpha)
+            CSL = norm.cdf(z_opt)
+        else:
+            z_opt = params.get('fixed_z', 1.645)
+            CSL = norm.cdf(z_opt)
+
+    # K：单次订货固定成本
+    K = params.get('ordering_cost_K', 100.0)
+    # 经济订货批量 Q*
+    Q_star = np.sqrt(2 * mu_d * K / H) if H > 0 else mu_d * L
+
+    # 根据需求类型确定策略及实际使用的 Q 和 z
     if dtype in ['间歇型（块状）需求', '平稳型需求（低频稳定）', '轻缓波动型需求']:
-        strategy = '(T,S)'; SS = 0; S = mu_d * params['intermittent_cycle'] * params['trend_factor']
-        qty = max(0, S - cur_stock) if cur_stock < S else 0
-        avg_inv = (S + cur_stock) / 2 if S else cur_stock
-        daily_cost = H * max(0, avg_inv); ROP_display = '-'; S_display = round(S, 0) if S else '-'
+        strategy = '(T,S)'
+        SS = 0.0
+        T_cycle = params.get('intermittent_cycle', 20)
+        S_target = mu_d * T_cycle * params.get('trend_factor', 1.2)
+        Q_used = mu_d * T_cycle
+        z_used = 0.0
+        ROP_display = '-'
+        S_display = round(S_target, 0) if S_target else '-'
+        qty = max(0, S_target - cur_stock) if cur_stock < S_target else 0
+
     elif dtype in ['平稳型需求', '波动型需求']:
-        strategy = '(R,Q)'; SS = 0; ROP = mu_d * L; K = params.get('K', 100.0)
-        Q = np.sqrt(2 * mu_d * K / H) if H > 0 else mu_d * L
-        qty = max(0, Q) if cur_stock <= ROP else 0
-        avg_inv = (ROP + cur_stock) / 2 if ROP else cur_stock
-        daily_cost = H * max(0, avg_inv); ROP_display = round(ROP, 0); S_display = '-'
+        strategy = '(R,Q)'
+        SS = 0.0
+        ROP = mu_d * L
+        Q_used = Q_star
+        z_used = 0.0
+        ROP_display = round(ROP, 0)
+        S_display = '-'
+        qty = max(0, Q_used) if cur_stock <= ROP else 0
+
+    else:  # 趋势型需求（增长/衰退）
+        strategy = '(s,S)'
+        SS = z_opt * sigma_d * np.sqrt(L)
+        ROP = mu_d * L + SS
+        safety_cycle = params.get('safety_cycle', 14)
+        trend_factor = params.get('trend_factor', 1.2)
+        S_target = mu_d * (L + safety_cycle) * trend_factor + SS
+        Q_used = mu_d * safety_cycle * trend_factor
+        z_used = z_opt
+        ROP_display = round(ROP, 0)
+        S_display = round(S_target, 0)
+        qty = max(0, S_target - cur_stock) if cur_stock <= ROP else 0
+
+    # 统一目标函数计算期望日总成本（式4-8）
+    term1 = H * (z_used * sigma_d * np.sqrt(L) + Q_used / 2)
+    term2 = (B * mu_d / Q_used) * sigma_d * np.sqrt(L) * loss(z_used)
+    term3 = (K * mu_d) / Q_used
+    daily_cost = term1 + term2 + term3
+
+    # 优先级（与原逻辑一致）
+    if qty > 0:
+        priority = '高' if theta >= 0.18 else '中'
     else:
-        strategy = '(s,S)'; SS = z_opt * sigma_d * np.sqrt(L); ROP = mu_d * L + SS
-        S = mu_d * (L + params['safety_cycle']) * params['trend_factor'] + SS
-        qty = max(0, S - cur_stock) if cur_stock <= ROP else 0
-        I_bar = mu_d * L + SS + 0.5 * mu_d * params['safety_cycle'] * params['trend_factor']
-        if sigma_d > 0:
-            z_ss = SS / (sigma_d * np.sqrt(L)) if sigma_d * np.sqrt(L) > 0 else 0
-            U_bar = sigma_d * np.sqrt(L) * (norm.pdf(z_ss) - z_ss * (1 - norm.cdf(z_ss)))
-        else: U_bar = 0
-        daily_cost = H * I_bar + B * U_bar / L; ROP_display = round(ROP, 0); S_display = round(S, 0)
-    if qty > 0: priority = '高' if theta >= 0.18 else '中'
-    else:
-        if (strategy in ['(R,Q)', '(s,S)'] and cur_stock > 1.5 * ROP) or dtype in ['趋势型需求（衰退）']: priority = '低'
-        else: priority = '低'
-    return pd.Series({'策略': strategy, '安全库存': round(SS, 0) if SS is not None else '-', '订货点': ROP_display, '目标库存': S_display,
-                      '建议补货量': round(qty, 0), '优先级': priority, '服务水平': round(CSL*100, 1), '期望日总成本': round(daily_cost, 2)})
+        if strategy in ['(R,Q)', '(s,S)'] and 'ROP' in locals() and cur_stock > 1.5 * ROP:
+            priority = '低'
+        else:
+            priority = '低'
+
+    return pd.Series({
+        '策略': strategy,
+        '安全库存': round(SS, 0) if SS > 0 else '—',
+        '订货点': ROP_display,
+        '目标库存': S_display,
+        '建议补货量': round(qty, 0),
+        '优先级': priority,
+        '服务水平': round(CSL * 100, 1),
+        '期望日总成本': round(daily_cost, 2)
+    })
 
 def short_name(name):
     name_map = {
@@ -1030,7 +1093,6 @@ with st.sidebar:
                     resp = requests.post("https://api.deepseek.com/v1/chat/completions", json=payload, headers=headers, timeout=60)
                 if resp.status_code == 200:
                     reply = resp.json()["choices"][0]["message"]["content"]
-                    # 不再调用 execute_action
                     st.session_state.xiaoku_msgs.append({"role": "assistant", "content": reply})
                 else:
                     st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ API错误: {resp.status_code}"})
@@ -1089,6 +1151,7 @@ elif st.session_state.page == "库存优化":
 
 # ========== 页面内容 ==========
 if st.session_state.page == "概览":
+    # ...（完全相同，略）...
     st.markdown("""
     <div class="hero-banner">
         <h1><i class="fas fa-paw" style="margin-right: 10px;"></i> 宠物IP联名产品库存决策系统</h1>
@@ -1403,7 +1466,6 @@ elif st.session_state.page == "需求预测":
         model_list = ["加权移动平均", "霍尔特双参数+IP调整", "季节调整移动平均",
                       "基础平稳+IP缓冲", "简单指数平滑+衰退系数", "朴素预测+批量调整"]
 
-        # 开始预测按钮 + 触发标志
         col_btn1, col_btn2 = st.columns([1,4])
         with col_btn1:
             start_click = st.button("开始预测", type="primary")
@@ -1534,9 +1596,8 @@ elif st.session_state.page == "库存优化":
             'trend_factor': trend_factor,
             'intermittent_cycle': intermittent_cycle,
             'safety_cycle': 14,
-            'K': ordering_cost_K
+            'ordering_cost_K': ordering_cost_K
         }
-        # 按钮 + 触发标志
         if st.button("生成订货建议", type="primary") or st.session_state.pop("trigger_advice", False):
             with st.spinner("正在计算最优订货建议..."):
                 advice_opt = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=None), axis=1)
