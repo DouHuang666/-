@@ -7,7 +7,6 @@ from io import BytesIO
 from scipy.stats import norm
 from datetime import datetime
 import requests
-import time
 import re
 
 st.set_page_config(page_title="宠物IP联名产品库存智能决策系统", layout="wide", page_icon="🐾")
@@ -571,19 +570,18 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ========== 内置知识库（基于论文核心内容） ==========
+# ========== 内置知识库 ==========
 KNOWLEDGE_CHUNKS = [
     "本研究聚焦C公司宠物IP联名产品的需求预测与库存订货策略优化。通过构建多维度需求特征指标体系、差异化预测模型体系、成本驱动的库存优化策略，并开发智能决策支持系统，成功将9款核心SKU的平均预测误差率由80.38%降至19.79%。",
     "需求特征指标包括：需求均值(μ)、需求标准差(σ)、需求变异系数(CV)、平均需求间隔(p)、非零需求均值(μ_NZ)、趋势强度(T)、季节波动系数(F_s)、IP营销波动系数(F_IP)、IP热度系数(H)、最大需求量(D_max)。",
     "基于决策树的需求分类规则：若p>=1.32且0.4<CV<0.8且μ_NZ<10则为间歇型，若p>=1.32且0.4<CV<0.8且μ_NZ>=10则为平稳型（低频稳定），若p>=1.32且(CV<=0.4或CV>=0.8)则为轻缓波动型。若p<1.32且|T|>0.01且T>0则为趋势增长型，若T<0则为趋势衰退型。若p<1.32且|T|<=0.01且CV>=0.6且(F_s>=1.2或F_IP>=1.4)则为波动型，否则为平稳型。",
     "预测模型匹配：趋势增长型用霍尔特双参数指数平滑+IP调整；趋势衰退型用简单指数平滑+衰退系数；波动型用季节调整移动平均；平稳型用加权移动平均；间歇型/低频稳定型/轻缓波动型用朴素预测+批量调整。",
-    "最优服务水平公式（基于成本平衡）：CSL* = B/(B+H*L)，其中B为单位缺货成本，H为单位日持有成本，L为提前期。最优安全库存SS* = z* * σ_d * sqrt(L)。",
-    "补货策略：(T,S)适用于间歇型、低频稳定型、轻缓波动型；(R,Q)适用于平稳型、波动型；(s,S)适用于趋势增长型和趋势衰退型。",
-    "优化后9个SKU平均MAPE从80.38%降至19.79%，库存日总成本从113.12元降至45.19元，节约60.05%。朱迪棒棒糖等IP热点产品节约比例超过70%。"
+    "最优服务水平公式（基于成本平衡）：通过迭代求解联立方程得到最优(z,Q)，其中G(z)=φ(z)-z(1-Φ(z))。安全库存SS=z·σ_d·√L，订货点R=μ·L+SS，订货批量Q由迭代公式确定。",
+    "补货策略：(T,S)适用于间歇型、低频稳定型、轻缓波动型；(R,Q)适用于趋势型（增长/衰退）、平稳型、波动型。(R,Q)策略设置安全库存，通过迭代法联立求解最优服务水平与订货批量。",
+    "优化后9个SKU平均MAPE从80.38%降至19.79%，库存日总成本从159.72元降至94.84元，节约64.87元/天，平均节约比例37.4%。朱迪棒棒糖等IP热点产品节约比例超过56%。"
 ]
 
 def retrieve_knowledge(query, top_k=2):
-    """基于关键词匹配检索最相关的知识段落"""
     words = set(re.findall(r'[\u4e00-\u9fa5a-zA-Z0-9]+', query))
     scores = []
     for chunk in KNOWLEDGE_CHUNKS:
@@ -595,9 +593,7 @@ def retrieve_knowledge(query, top_k=2):
     retrieved = [KNOWLEDGE_CHUNKS[i] for i in top_indices if scores[i] > 0]
     return "\n\n".join(retrieved) if retrieved else "（未找到高度相关段落，请参考通用知识）"
 
-# ========== 获取系统当前状态的文本描述 ==========
 def get_system_state_context():
-    """收集当前 session_state 中的数据，生成可供 AI 阅读的上下文"""
     context = "【当前系统状态】\n"
     context += f"- 当前页面: {st.session_state.get('page', '概览')}\n"
     context += f"- 特征是否已计算: {st.session_state.get('features_computed', False)}\n"
@@ -772,89 +768,138 @@ def classify_demand_type(row):
         if cv >= 0.6 and (fs >= 1.2 or f_ip >= 1.4): return '波动型需求'
         else: return '平稳型需求'
 
-def compute_optimal_z(b, h, L):
-    if b + h * L == 0: return 1.645
-    alpha = b / (b + h * L)
-    if alpha >= 1: return 3.0
-    if alpha <= 0: return 0.0
-    return norm.ppf(alpha)
-
-def holt_exponential_smoothing(series, alpha, beta, forecast_steps=1):
-    n = len(series)
-    if n == 0: return 0
-    if n == 1: return series[0]
-    level = series[0]; trend = series[1] - series[0] if n > 1 else 0
-    for t in range(1, n):
-        last_level = level
-        level = alpha * series[t] + (1 - alpha) * (level + trend)
-        trend = beta * (level - last_level) + (1 - beta) * trend
-    return level + forecast_steps * trend
-
-def simple_exponential_smoothing(series, alpha, forecast_steps=1):
-    if len(series) == 0: return 0
-    s = series[0]
-    for val in series[1:]: s = alpha * val + (1 - alpha) * s
-    return s
-
+# ========== compute_features_from_window ==========
 def compute_features_from_window(sales_window, season_days, off_season_days, ip_days, non_ip_days,
                                  season_pos, off_season_pos, ip_pos, non_ip_pos):
-    n = len(sales_window); mu = np.mean(sales_window)
+    n = len(sales_window)
+    mu = np.mean(sales_window)
     if n >= 6:
-        recent_avg = np.mean(sales_window[-3:]); early_avg = np.mean(sales_window[:3])
+        early_avg = np.mean(sales_window[:3])
+        recent_avg = np.mean(sales_window[-3:])
         T = (recent_avg - early_avg) / early_avg if early_avg != 0 else 0
-    else: T = 0
-    if season_pos == "末尾": season_slice = sales_window[-season_days:] if n >= season_days else sales_window
-    else: season_slice = sales_window[:season_days] if n >= season_days else sales_window
-    if off_season_pos == "末尾": off_season_slice = sales_window[-off_season_days:] if n >= off_season_days else sales_window
-    else: off_season_slice = sales_window[:off_season_days] if n >= off_season_days else sales_window
-    season_avg = np.mean(season_slice); off_season_avg = np.mean(off_season_slice)
+    else:
+        T = 0
+    if season_pos == "末尾":
+        season_slice = sales_window[-season_days:] if n >= season_days else sales_window
+    else:
+        season_slice = sales_window[:season_days] if n >= season_days else sales_window
+    if off_season_pos == "末尾":
+        off_season_slice = sales_window[-off_season_days:] if n >= off_season_days else sales_window
+    else:
+        off_season_slice = sales_window[:off_season_days] if n >= off_season_days else sales_window
+    season_avg = np.mean(season_slice)
+    off_season_avg = np.mean(off_season_slice)
     Fs = season_avg / off_season_avg if off_season_avg != 0 else 1.0
-    if ip_pos == "末尾": ip_slice = sales_window[-ip_days:] if n >= ip_days else sales_window
-    else: ip_slice = sales_window[:ip_days] if n >= ip_days else sales_window
-    if non_ip_pos == "末尾": non_ip_slice = sales_window[-non_ip_days:] if n >= non_ip_days else sales_window
-    else: non_ip_slice = sales_window[:non_ip_days] if n >= non_ip_days else sales_window
-    ip_avg = np.mean(ip_slice); non_ip_avg = np.mean(non_ip_slice)
+    if ip_pos == "末尾":
+        ip_slice = sales_window[-ip_days:] if n >= ip_days else sales_window
+    else:
+        ip_slice = sales_window[:ip_days] if n >= ip_days else sales_window
+    if non_ip_pos == "末尾":
+        non_ip_slice = sales_window[-non_ip_days:] if n >= non_ip_days else sales_window
+    else:
+        non_ip_slice = sales_window[:non_ip_days] if n >= non_ip_days else sales_window
+    ip_avg = np.mean(ip_slice)
+    non_ip_avg = np.mean(non_ip_slice)
     F_IP = ip_avg / non_ip_avg if non_ip_avg != 0 else 1.0
     return mu, T, Fs, F_IP, non_ip_avg
 
+# ========== predict_sku_with_model ==========
 def predict_sku_with_model(train_series, model_type, forecast_days, params, features):
-    mu = features['mu']; T = features['T']; Fs = features['Fs']; F_IP = features['F_IP']; non_ip_mean = features['non_ip_mean']
+    mu = features['mu']
+    T = features['T']
+    Fs = features['Fs']
+    F_IP = features['F_IP']
+    non_ip_mean = features.get('non_ip_mean', mu)
     if params.get('future_no_ip', False) and model_type in ["霍尔特双参数+IP调整", "基础平稳+IP缓冲"]:
         base_val = non_ip_mean * params.get('persist_factor', 1.0)
-    else: base_val = mu
+    else:
+        base_val = mu
     if model_type == "加权移动平均":
         if len(train_series) >= 3:
             recent_3 = train_series[-3:]
             pred_daily = recent_3[0]*params['w1'] + recent_3[1]*params['w2'] + recent_3[2]*params['w3']
-        else: pred_daily = base_val
+        else:
+            pred_daily = base_val
         return pred_daily * forecast_days
     elif model_type == "霍尔特双参数+IP调整":
-        holt_pred = holt_exponential_smoothing(train_series, params['alpha'], params['beta'], forecast_steps=1)
-        adjust = min(F_IP, params['ip_cap'])
-        return holt_pred * adjust * forecast_days
+        alpha = params['alpha']
+        beta = params['beta']
+        n = len(train_series)
+        if n == 0:
+            level = mu
+            trend = 0
+        elif n == 1:
+            level = train_series[0]
+            trend = 0
+        else:
+            level = train_series[0]
+            trend = train_series[1] - train_series[0]
+            for t in range(1, n):
+                last_level = level
+                level = alpha * train_series[t] + (1 - alpha) * (level + trend)
+                trend = beta * (level - last_level) + (1 - beta) * trend
+        pred_daily = level + trend
+        adjust = min(F_IP, params.get('ip_cap', 1.8))
+        return pred_daily * adjust * forecast_days
     elif model_type == "季节调整移动平均":
         fs_used = params.get('fs_override', 0.0) if params.get('fs_override', 0.0) > 0 else Fs
-        if len(train_series) >= 3: avg_3 = np.mean(train_series[-3:])
-        else: avg_3 = mu
+        if len(train_series) >= 3:
+            avg_3 = np.mean(train_series[-3:])
+        else:
+            avg_3 = mu
         return avg_3 * fs_used * forecast_days
     elif model_type == "基础平稳+IP缓冲":
-        adjust = 1 + (F_IP - 1) / params['buffer_factor']
+        adjust = 1 + (F_IP - 1) / params.get('buffer_factor', 2.0)
         return base_val * adjust * forecast_days
     elif model_type == "简单指数平滑+衰退系数":
-        ses_pred = simple_exponential_smoothing(train_series, params['alpha'], forecast_steps=1)
-        decay = 1 - abs(T)
-        return ses_pred * decay * forecast_days
+        alpha = params.get('alpha', 0.3)
+        if len(train_series) == 0:
+            s = mu
+        else:
+            s = train_series[0]
+            for val in train_series[1:]:
+                s = alpha * val + (1 - alpha) * s
+        decay = 1 - abs(T) if abs(T) < 1 else 0.1
+        return s * decay * forecast_days
     elif model_type == "朴素预测+批量调整":
         non_zero = train_series[train_series > 0]
         last_nonzero = non_zero[-1] if len(non_zero) > 0 else mu
-        batch = max(last_nonzero * params['batch_mult'], params['min_order'])
+        batch = max(last_nonzero * params.get('batch_mult', 1.2), params.get('min_order', 30))
         weeks = forecast_days / 7.0
         return batch * weeks
-    else: return mu * forecast_days
+    else:
+        return mu * forecast_days
 
-# ========== 新库存成本模型（基于论文第四章式4-8） ==========
+# ========== 迭代求解 (Q,z) 核心函数 ==========
+def solve_optimal_RQ(mu_d, sigma_d, L, H, B, K, max_iter=20, tol=1e-2):
+    sigma_L = sigma_d * np.sqrt(L)
+    Q = np.sqrt(2 * mu_d * K / H) if H > 0 else mu_d * L
+    z = 0.0
+    for _ in range(max_iter):
+        if B > 0:
+            ratio = H * Q / (B * mu_d)
+            if ratio >= 1.0:
+                z = 0.0
+                break
+            phi_z = 1 - ratio
+            if phi_z <= 0.5:
+                z = 0.0
+            else:
+                z = norm.ppf(phi_z)
+        else:
+            z = 0.0
+        Gz = norm.pdf(z) - z * (1 - norm.cdf(z))
+        Q_new = np.sqrt(2 * mu_d / H * (K + B * sigma_L * Gz))
+        if abs(Q_new - Q) < tol:
+            Q = Q_new
+            break
+        Q = Q_new
+    if z < 0:
+        z = 0.0
+    return Q, z
+
+# ========== 核心：compute_inventory_advice（修改 (T,S) 逻辑） ==========
 def compute_inventory_advice(row, period_days, params, service_level_override=None):
-    """基于成本优化模型（持有、缺货、订货成本）计算库存优化建议。返回字段与原系统完全一致。"""
     dtype = row['需求类型']
     mu_d = row['预测销量'] / period_days
     sigma_d = row['需求标准差σ']
@@ -866,93 +911,92 @@ def compute_inventory_advice(row, period_days, params, service_level_override=No
     C_w = row['仓储成本']
     r = row['资金占用成本']
 
-    # 单位日持有成本 H 和单位缺货成本 B
     H = (P * r + C_w * 12) / 365
     B = R_price * theta
+    sigma_L = sigma_d * np.sqrt(L)
+    K = params.get('ordering_cost_K', 100.0)
 
-    # 损失函数 G(z) = φ(z) - z*(1-Φ(z))
     def loss(z):
         return norm.pdf(z) - z * (1 - norm.cdf(z))
 
-    # 确定安全系数 z_opt 与服务水平
-    if service_level_override is not None:
-        CSL = service_level_override
-        z_opt = norm.ppf(CSL)
-    else:
-        if params.get('use_cost_optimization', False):
-            alpha = B / (B + H * L) if (B + H * L) > 0 else 0.5
-            alpha = max(0.001, min(0.999, alpha))
-            z_opt = norm.ppf(alpha)
-            CSL = norm.cdf(z_opt)
-        else:
-            z_opt = params.get('fixed_z', 1.645)
-            CSL = norm.cdf(z_opt)
-
-    # K：单次订货固定成本
-    K = params.get('ordering_cost_K', 100.0)
-    # 经济订货批量 Q*
-    Q_star = np.sqrt(2 * mu_d * K / H) if H > 0 else mu_d * L
-
-    # 根据需求类型确定策略及实际使用的 Q 和 z
+    # ========== (T,S) 策略 ==========
     if dtype in ['间歇型（块状）需求', '平稳型需求（低频稳定）', '轻缓波动型需求']:
         strategy = '(T,S)'
         SS = 0.0
         T_cycle = params.get('intermittent_cycle', 20)
-        S_target = mu_d * T_cycle * params.get('trend_factor', 1.2)
-        Q_used = mu_d * T_cycle
+        # 关键修改：Q = mu_d * (T_cycle + L)，不设安全库存，目标库存等于订货批量
+        Q_used = mu_d * (T_cycle + L)
         z_used = 0.0
         ROP_display = '-'
+        S_target = Q_used
         S_display = round(S_target, 0) if S_target else '-'
         qty = max(0, S_target - cur_stock) if cur_stock < S_target else 0
+        # 服务水平不适用，用 None 标记（后续渲染成横杠）
+        service_level = None
 
-    elif dtype in ['平稳型需求', '波动型需求']:
-        strategy = '(R,Q)'
-        SS = 0.0
-        ROP = mu_d * L
-        Q_used = Q_star
-        z_used = 0.0
-        ROP_display = round(ROP, 0)
-        S_display = '-'
-        qty = max(0, Q_used) if cur_stock <= ROP else 0
+        term_hold = H * (SS + Q_used / 2)
+        term_short = (B * mu_d / Q_used) * sigma_L * loss(z_used)
+        term_order = (K * mu_d) / Q_used
+        daily_cost = term_hold + term_short + term_order
 
-    else:  # 趋势型需求（增长/衰退）
-        strategy = '(s,S)'
-        SS = z_opt * sigma_d * np.sqrt(L)
-        ROP = mu_d * L + SS
-        safety_cycle = params.get('safety_cycle', 14)
-        trend_factor = params.get('trend_factor', 1.2)
-        S_target = mu_d * (L + safety_cycle) * trend_factor + SS
-        Q_used = mu_d * safety_cycle * trend_factor
-        z_used = z_opt
-        ROP_display = round(ROP, 0)
-        S_display = round(S_target, 0)
-        qty = max(0, S_target - cur_stock) if cur_stock <= ROP else 0
-
-    # 统一目标函数计算期望日总成本（式4-8）
-    term1 = H * (z_used * sigma_d * np.sqrt(L) + Q_used / 2)
-    term2 = (B * mu_d / Q_used) * sigma_d * np.sqrt(L) * loss(z_used)
-    term3 = (K * mu_d) / Q_used
-    daily_cost = term1 + term2 + term3
-
-    # 优先级（与原逻辑一致）
-    if qty > 0:
-        priority = '高' if theta >= 0.18 else '中'
-    else:
-        if strategy in ['(R,Q)', '(s,S)'] and 'ROP' in locals() and cur_stock > 1.5 * ROP:
-            priority = '低'
+        if qty > 0:
+            priority = '高' if theta >= 0.18 else '中'
         else:
             priority = '低'
 
-    return pd.Series({
-        '策略': strategy,
-        '安全库存': round(SS, 0) if SS > 0 else '—',
-        '订货点': ROP_display,
-        '目标库存': S_display,
-        '建议补货量': round(qty, 0),
-        '优先级': priority,
-        '服务水平': round(CSL * 100, 1),
-        '期望日总成本': round(daily_cost, 2)
-    })
+        return pd.Series({
+            '策略': strategy,
+            '安全库存': round(SS, 0) if SS > 0 else '-',
+            '订货点': ROP_display,
+            '目标库存': S_display,
+            '建议补货量': round(qty, 0),
+            '优先级': priority,
+            '服务水平': service_level,          # 这里为 None
+            '期望日总成本': round(daily_cost, 2)
+        })
+
+    # ========== (R,Q) 策略（原逻辑不变） ==========
+    else:
+        strategy = '(R,Q)'
+        if service_level_override is not None:
+            CSL = service_level_override
+            z_used = norm.ppf(CSL)
+            Gz = loss(z_used)
+            Q_used = np.sqrt(2 * mu_d / H * (K + B * sigma_L * Gz))
+        else:
+            Q_used, z_used = solve_optimal_RQ(mu_d, sigma_d, L, H, B, K)
+            CSL = norm.cdf(z_used)
+
+        SS = z_used * sigma_L
+        ROP = mu_d * L + SS
+        ROP_display = round(ROP, 0)
+        S_display = '-'
+        qty = max(0, Q_used) if cur_stock <= ROP else 0
+        service_level = round(CSL * 100, 1)
+
+        term_hold = H * (z_used * sigma_L + Q_used / 2)
+        term_short = (B * mu_d / Q_used) * sigma_L * loss(z_used)
+        term_order = (K * mu_d) / Q_used
+        daily_cost = term_hold + term_short + term_order
+
+        if qty > 0:
+            priority = '高' if theta >= 0.18 else '中'
+        else:
+            if cur_stock > 1.5 * ROP:
+                priority = '低'
+            else:
+                priority = '低'
+
+        return pd.Series({
+            '策略': strategy,
+            '安全库存': round(SS, 0) if SS > 0 else '-',
+            '订货点': ROP_display,
+            '目标库存': S_display,
+            '建议补货量': round(qty, 0),
+            '优先级': priority,
+            '服务水平': service_level,
+            '期望日总成本': round(daily_cost, 2)
+        })
 
 def short_name(name):
     name_map = {
@@ -1031,7 +1075,7 @@ for option in nav_options:
 
 st.sidebar.markdown('<hr>', unsafe_allow_html=True)
 
-# ========== AI 小库（侧边栏）- 仅问答，无控制功能 ==========
+# ========== AI 小库（侧边栏） ==========
 if "xiaoku_msgs" not in st.session_state:
     st.session_state.xiaoku_msgs = [{"role": "assistant", "content": "👋 你好！我是小库，已接入论文知识库和系统实时数据。我可以帮你分析需求特征、预测销量、优化库存等相关问题。有什么我能帮你的吗？"}]
 if "xiaoku_api_key" not in st.session_state:
@@ -1050,7 +1094,7 @@ with st.sidebar:
         for msg in st.session_state.xiaoku_msgs:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
-        user_q = st.chat_input("输入你的问题，例如：分析朱迪棒棒糖的需求类型，或者解释成本优化模型", key="xiaoku_chat_input")
+        user_q = st.chat_input("输入你的问题", key="xiaoku_chat_input")
         if user_q:
             st.session_state.xiaoku_msgs.append({"role": "user", "content": user_q})
             st.rerun()
@@ -1070,8 +1114,8 @@ with st.sidebar:
             system_state = get_system_state_context()
             system_prompt = f"""
 你是宠物IP联名产品库存智能决策系统AI助理“小库”。你的能力：
-- 基于论文知识库回答专业问题（论文核心内容：需求特征分类、预测模型、成本优化模型、差异化补货策略等）。
-- 感知系统当前所有数据（特征分析、预测结果、库存建议等）。
+- 基于论文知识库回答专业问题。
+- 感知系统当前所有数据。
 
 【论文知识库相关片段】
 {retrieved}
@@ -1079,9 +1123,8 @@ with st.sidebar:
 {system_state}
 
 【回复要求】
-1. 仅基于知识库和系统数据回答用户问题，不要尝试执行任何操作（不要切换页面、修改参数、触发按钮）。
-2. 如果用户要求控制系统（如“切换页面”“修改参数”“开始预测”），请礼貌告知此类操作需要手动完成。
-3. 回答清晰、专业、简洁。
+1. 仅基于知识库和系统数据回答，不要尝试执行操作。
+2. 回答清晰、专业、简洁。
 """
             messages = [{"role": "system", "content": system_prompt}]
             for m in st.session_state.xiaoku_msgs[-8:]:
@@ -1100,7 +1143,7 @@ with st.sidebar:
                 st.session_state.xiaoku_msgs.append({"role": "assistant", "content": f"❌ 请求失败: {str(e)}"})
             st.rerun()
 
-# ========== 动态参数面板（侧边栏）- 保持原有 setattr 方式 ==========
+# ========== 动态参数面板（侧边栏） ==========
 if st.session_state.page == "数据上传":
     with st.sidebar.expander("⚙️ 特征计算参数", expanded=False):
         param_with_help(lambda: setattr(st.session_state, 'season_pos', st.selectbox("旺季位置", ["末尾", "开头"], index=1)), "选择旺季数据在时间窗口的末尾或开头")
@@ -1141,10 +1184,10 @@ elif st.session_state.page == "需求预测":
             param_with_help(lambda: setattr(st.session_state, 'show_old_method', st.checkbox("计算旧方法MAD", value=True)), "同时计算简单平均法的MAD作为对比")
 elif st.session_state.page == "库存优化":
     with st.sidebar.expander("📦 库存策略参数", expanded=False):
-        param_with_help(lambda: setattr(st.session_state, 'use_cost_opt', st.checkbox("启用成本驱动服务水平优化", value=True)), "根据缺货成本与仓储成本自动优化服务水平")
+        param_with_help(lambda: setattr(st.session_state, 'use_cost_opt', st.checkbox("启用成本驱动服务水平优化", value=True)), "根据缺货成本与仓储成本自动优化服务水平（迭代求解最优Q和z）")
         if not st.session_state.use_cost_opt:
             param_with_help(lambda: setattr(st.session_state, 'fixed_z', st.number_input("固定z值", 1.0, 3.0, 1.645, 0.05)), "手动设置安全库存系数（z分数）")
-        param_with_help(lambda: setattr(st.session_state, 'trend_factor', st.slider("趋势放大系数", 0.5, 2.0, 1.2, 0.05)), "考虑需求增长时放大目标库存")
+        param_with_help(lambda: setattr(st.session_state, 'trend_factor', st.slider("趋势放大系数", 0.5, 2.0, 1.2, 0.05)), "考虑需求增长时放大目标库存（仅用于(R,Q)策略）")
         param_with_help(lambda: setattr(st.session_state, 'intermittent_cycle', st.number_input("间歇型补货周期(天)", 7, 60, 20, 1)), "间歇型需求的补货间隔天数")
         param_with_help(lambda: setattr(st.session_state, 'ordering_cost_K', st.number_input("单次订货固定成本 K (元/次)", 0.0, 1000.0, 100.0, 10.0)), "每次下单的固定成本，影响经济订货批量")
         param_with_help(lambda: setattr(st.session_state, 'user_service_level', st.slider("自定义服务水平 (%)", 80, 99, 95, 1) / 100), "您希望达到的现货率（0-100%）")
@@ -1157,41 +1200,38 @@ if st.session_state.page == "概览":
         <p>专为IP联名宠物产品设计的智能库存管理工具，集成需求特征分析、多模型预测、成本优化与差异补货策略</p>
     </div>
     """, unsafe_allow_html=True)
-
     if st.session_state.features_computed:
         sku_count = len(st.session_state.base_df) if st.session_state.base_df is not None else 0
         st.success(f"✅ 数据已就绪 | 共 {sku_count} 个SKU | 可进行需求预测与库存优化")
     else:
         st.info("📂 请先上传销售数据与库存数据，系统将自动计算特征并生成建议")
-
     col1, col2, col3 = st.columns(3)
     with col1:
         st.markdown("""
-        <div class="metric-card" style="min-height: 160px; display: flex; flex-direction: column; justify-content: center;">
+        <div class="metric-card" style="min-height: 160px;">
             <div class="metric-value"><i class="fas fa-chart-line"></i></div>
             <div class="metric-label">需求特征分析</div>
-            <small style="color: #1f6e8c;">自动计算CV、趋势、季节系数、IP影响系数等</small>
+            <small>自动计算CV、趋势、季节系数、IP影响系数等</small>
         </div>
         """, unsafe_allow_html=True)
     with col2:
         st.markdown("""
-        <div class="metric-card" style="min-height: 160px; display: flex; flex-direction: column; justify-content: center;">
+        <div class="metric-card" style="min-height: 160px;">
             <div class="metric-value"><i class="fas fa-brain"></i></div>
             <div class="metric-label">6种预测模型</div>
-            <small style="color: #1f6e8c;">加权移动平均、霍尔特双参数、季节调整、IP缓冲、指数平滑+衰退、朴素批量</small>
+            <small>加权移动平均、霍尔特双参数、季节调整、IP缓冲、指数平滑+衰退、朴素批量</small>
         </div>
         """, unsafe_allow_html=True)
     with col3:
         st.markdown("""
-        <div class="metric-card" style="min-height: 160px; display: flex; flex-direction: column; justify-content: center;">
+        <div class="metric-card" style="min-height: 160px;">
             <div class="metric-value"><i class="fas fa-boxes"></i></div>
             <div class="metric-label">智能库存优化</div>
-            <small style="color: #1f6e8c;">成本优化模型自动寻优、差异化补货策略、(R,Q)/(s,S)/(T,S)策略</small>
+            <small>成本驱动模型迭代求解、(R,Q)/(T,S)差异策略</small>
         </div>
         """, unsafe_allow_html=True)
-
     st.markdown("---")
-    st.markdown("<h3><i class='fas fa-rocket' style='margin-right: 8px;'></i> 快速开始</h3>", unsafe_allow_html=True)
+    st.markdown("<h3><i class='fas fa-rocket'></i> 快速开始</h3>", unsafe_allow_html=True)
     step_cols = st.columns(4)
     steps = [
         ("<i class='fas fa-upload'></i> 上传数据", "上传近28天销售明细与产品库存成本表"),
@@ -1202,14 +1242,13 @@ if st.session_state.page == "概览":
     for i, col in enumerate(step_cols):
         with col:
             st.markdown(f"""
-            <div style="background: white; border-radius: 20px; padding: 16px; margin-bottom: 12px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); text-align: center;">
-                <div style="font-size: 1.3rem; font-weight: 700; margin-bottom: 6px; color: #0a3b4b;">{steps[i][0]}</div>
+            <div style="background: white; border-radius: 20px; padding: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); text-align: center;">
+                <div style="font-size: 1.3rem; font-weight: 700; color: #0a3b4b;">{steps[i][0]}</div>
                 <div style="font-size: 0.7rem; color: #1f6e8c;">{steps[i][1]}</div>
             </div>
             """, unsafe_allow_html=True)
-    
     st.markdown("---")
-    st.markdown("<h3><i class='fas fa-table' style='margin-right: 8px;'></i> 数据示例预览</h3>", unsafe_allow_html=True)
+    st.markdown("<h3><i class='fas fa-table'></i> 数据示例预览</h3>", unsafe_allow_html=True)
     if st.session_state.features_computed and st.session_state.daily_df is not None:
         st.markdown("**最新销售数据（近5天）**")
         sample_sales = st.session_state.daily_df.tail(5).reset_index().rename(columns={'index': '日期'})
@@ -1220,31 +1259,30 @@ if st.session_state.page == "概览":
     else:
         st.markdown("""
         <div style="background: #f8fafc; border-radius: 20px; padding: 16px; border: 1px dashed #cbd5e1;">
-            <p style="color: #1f6e8c;"><i class="fas fa-upload"></i> 尚未上传数据，请点击左侧「数据上传」上传Excel文件。<br>
-            系统会自动识别SKU、计算需求特征、选择最优预测模型并给出库存建议。</p>
-            <p><strong style="color: #0a3b4b;">销售数据格式：</strong> <span style="color: #1f6e8c;">第一列为日期，后续每列为一个SKU的日销量。</span><br>
-            <strong style="color: #0a3b4b;">库存数据格式：</strong> <span style="color: #1f6e8c;">包含商品名称、提前期、采购价、仓储成本、缺货成本占比等字段。</span></p>
-            <p style="color: #1f6e8c;">👉 可点击「数据上传」页面下载模板。</p>
+            <p><i class="fas fa-upload"></i> 尚未上传数据，请点击左侧「数据上传」上传Excel文件。</p>
+            <p><strong>销售数据格式：</strong> 第一列为日期，后续每列为一个SKU的日销量。<br>
+            <strong>库存数据格式：</strong> 包含商品名称、提前期、采购价、仓储成本、缺货成本占比等字段。</p>
+            <p>👉 可点击「数据上传」页面下载模板。</p>
         </div>
         """, unsafe_allow_html=True)
-    
     st.markdown("---")
-    st.markdown("<h3><i class='fas fa-star' style='margin-right: 8px;'></i> 系统亮点</h3>", unsafe_allow_html=True)
+    st.markdown("<h3><i class='fas fa-star'></i> 系统亮点</h3>", unsafe_allow_html=True)
     highlight_cols = st.columns(3)
     highlights = [
-        ("<i class='fas fa-target'></i> 精准分类", "基于5维特征（CV、趋势、季节、IP、间隔）自动划分需求类型"),
-        ("<i class='fas fa-sliders-h'></i> 模型自选", "滚动窗口MAD对比 + 手动覆盖，灵活选择预测模型"),
-        ("<i class='fas fa-chart-line'></i> 成本优化", "成本驱动模型动态计算最优服务水平，量化自定义服务水平成本增幅")
+        ("<i class='fas fa-target'></i> 精准分类", "基于5维特征自动划分需求类型"),
+        ("<i class='fas fa-sliders-h'></i> 模型自选", "滚动窗口MAD对比 + 手动覆盖"),
+        ("<i class='fas fa-chart-line'></i> 成本优化", "成本驱动模型动态计算最优服务水平")
     ]
     for i, col in enumerate(highlight_cols):
         with col:
             st.markdown(f"""
-            <div style="background: white; border-radius: 20px; padding: 12px; margin-bottom: 8px; box-shadow: 0 1px 4px rgba(0,0,0,0.05);">
-                <strong style="color: #0a3b4b;">{highlights[i][0]}</strong><br>
-                <span style="font-size: 0.7rem; color: #1f6e8c;">{highlights[i][1]}</span>
+            <div style="background: white; border-radius: 20px; padding: 12px;">
+                <strong>{highlights[i][0]}</strong><br>
+                <span style="font-size: 0.7rem;">{highlights[i][1]}</span>
             </div>
             """, unsafe_allow_html=True)
 
+# 数据上传页面
 elif st.session_state.page == "数据上传":
     st.markdown("<h1><i class='fas fa-upload'></i> 数据上传</h1>", unsafe_allow_html=True)
     st.markdown("<h3><i class='fas fa-download'></i> 下载数据模板</h3>", unsafe_allow_html=True)
@@ -1268,7 +1306,7 @@ elif st.session_state.page == "数据上传":
         if inv_file: st.session_state.inv_file = inv_file; st.success("库存数据已暂存")
     if st.button("加载并计算特征", type="primary"):
         if st.session_state.get('daily_file') and st.session_state.get('inv_file'):
-            with st.spinner("正在计算特征，请稍候..."):
+            with st.spinner("正在计算特征..."):
                 daily_df = pd.read_excel(st.session_state.daily_file)
                 inv_df = pd.read_excel(st.session_state.inv_file)
                 date_col = daily_df.columns[0]
@@ -1329,6 +1367,7 @@ elif st.session_state.page == "数据上传":
             render_table(inv_display, add_serial=True)
         card(show_data_preview)
 
+# 特征分析页面
 elif st.session_state.page == "特征分析":
     if not st.session_state.features_computed:
         st.warning("请先在「数据上传」页面计算特征。")
@@ -1375,7 +1414,7 @@ elif st.session_state.page == "特征分析":
                 st.plotly_chart(fig, use_container_width=True)
             with col_right:
                 st.markdown(f"""
-                <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
+                <div style="display: grid; grid-template-columns: repeat(2,1fr); gap:10px;">
                     <div class="feature-card"><div class="feature-icon"><i class="fas fa-calculator"></i></div><div class="feature-label">需求均值</div><div class="feature-value">{row['需求均值μ']:.2f}</div></div>
                     <div class="feature-card"><div class="feature-icon"><i class="fas fa-chart-line"></i></div><div class="feature-label">CV</div><div class="feature-value">{row['CV']:.2f}</div></div>
                     <div class="feature-card"><div class="feature-icon"><i class="fas fa-arrow-trend-up"></i></div><div class="feature-label">趋势强度</div><div class="feature-value" style="color: {'#16a34a' if row['趋势强度T']>0 else '#dc2626'};">{row['趋势强度T']:.2f}</div></div>
@@ -1385,43 +1424,24 @@ elif st.session_state.page == "特征分析":
                 </div>
                 """, unsafe_allow_html=True)
                 dtype = row['需求类型']
-                if '趋势型需求（增长）' in dtype:
-                    badge_class = "badge-demand-trend-up"
-                    icon = "📈"
-                elif '趋势型需求（衰退）' in dtype:
-                    badge_class = "badge-demand-trend-down"
-                    icon = "📉"
-                elif '轻缓波动型需求' in dtype:
-                    badge_class = "badge-demand-fluctuation"
-                    icon = "🌊"
-                elif '平稳型需求' in dtype:
-                    badge_class = "badge-demand-stable"
-                    icon = "⚖️"
-                elif '间歇型（块状）需求' in dtype:
-                    badge_class = "badge-demand-intermittent"
-                    icon = "⏳"
-                else:
-                    badge_class = "badge-demand-default"
-                    icon = "📌"
+                if '趋势型需求（增长）' in dtype: badge_class = "badge-demand-trend-up"; icon="📈"
+                elif '趋势型需求（衰退）' in dtype: badge_class = "badge-demand-trend-down"; icon="📉"
+                elif '轻缓波动型需求' in dtype: badge_class = "badge-demand-fluctuation"; icon="🌊"
+                elif '平稳型需求' in dtype: badge_class = "badge-demand-stable"; icon="⚖️"
+                elif '间歇型（块状）需求' in dtype: badge_class = "badge-demand-intermittent"; icon="⏳"
+                else: badge_class = "badge-demand-default"; icon="📌"
                 st.markdown(f"""
                 <div class="demand-type-card">
                     <div class="demand-type-label">需求类型</div>
-                    <div class="demand-type-value"><span class="badge {badge_class}" style="font-size: 1rem;">{icon} {dtype}</span></div>
+                    <div class="demand-type-value"><span class="badge {badge_class}" style="font-size:1rem;">{icon} {dtype}</span></div>
                 </div>
                 """, unsafe_allow_html=True)
             st.markdown("<h3>需求特征指标</h3>", unsafe_allow_html=True)
             display_cols = {
-                '商品简称': '商品简称',
-                '需求均值μ': '需求均值',
-                '非零需求均值': '非零需求均值',
-                '平均需求间隔p': '平均需求间隔',
-                'CV': 'CV',
-                '趋势强度T': '趋势强度',
-                '季节系数Fs': '季节系数',
-                'IP系数F_IP': 'IP系数',
-                '零需求占比': '零需求占比',
-                '需求标准差σ': '需求标准差',
-                '需求类型': '需求类型'
+                '商品简称': '商品简称','需求均值μ': '需求均值','非零需求均值': '非零需求均值',
+                '平均需求间隔p': '平均需求间隔','CV': 'CV','趋势强度T': '趋势强度',
+                '季节系数Fs': '季节系数','IP系数F_IP': 'IP系数','零需求占比': '零需求占比',
+                '需求标准差σ': '需求标准差','需求类型': '需求类型'
             }
             df_display = base_df[list(display_cols.keys())].copy().reset_index(drop=True)
             df_display.rename(columns=display_cols, inplace=True)
@@ -1431,6 +1451,7 @@ elif st.session_state.page == "特征分析":
         else:
             card(lambda: None)
 
+# 需求预测页面
 elif st.session_state.page == "需求预测":
     if not st.session_state.features_computed:
         st.warning("请先在「数据上传」页面计算特征。")
@@ -1469,7 +1490,7 @@ elif st.session_state.page == "需求预测":
         with col_btn1:
             start_click = st.button("开始预测", type="primary")
         if start_click or st.session_state.pop("trigger_forecast", False):
-            with st.spinner("正在执行滚动验证和预测，请稍候..."):
+            with st.spinner("正在执行滚动验证和预测..."):
                 best_models = {}
                 if enable_validation and train_len + val_len <= total_days:
                     st.info("正在进行滚动窗口交叉验证...")
@@ -1554,7 +1575,7 @@ elif st.session_state.page == "需求预测":
                 st.success("预测完成！")
 
         with st.expander("✏️ 手动覆盖模型（可选）", expanded=False):
-            st.markdown("> 如果不满意自动选择的模型，可以在此手动指定。修改后请再次点击「开始预测」按钮。")
+            st.markdown("> 不满意自动选择的模型，可手动指定。修改后请再次点击「开始预测」。")
             sku_list = base_df['商品名称'].tolist()
             for sku in sku_list:
                 if sku not in st.session_state.manual_model_dict:
@@ -1577,6 +1598,7 @@ elif st.session_state.page == "需求预测":
                 render_table(show_df, add_serial=True)
             card(show_forecast)
 
+# 库存优化页面
 elif st.session_state.page == "库存优化":
     if st.session_state.forecast_df is None:
         st.warning("请先在「需求预测」页面完成预测。")
@@ -1599,7 +1621,9 @@ elif st.session_state.page == "库存优化":
         }
         if st.button("生成订货建议", type="primary") or st.session_state.pop("trigger_advice", False):
             with st.spinner("正在计算最优订货建议..."):
+                # 计算理论最优服务水平下的成本 (service_level_override=None)
                 advice_opt = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=None), axis=1)
+                # 计算用户自定义服务水平下的成本
                 advice_user = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=user_service_level), axis=1)
                 result_df = pd.concat([
                     base_df[['商品简称', '需求类型', '预测销量', '当前总库存']],
@@ -1617,15 +1641,19 @@ elif st.session_state.page == "库存优化":
                 result_df = st.session_state.result_df
                 st.markdown(f"""
                 <div class="param-dashboard">
-                    <div class="param-item"><div class="param-label"><i class="fas fa-chart-line"></i> 趋势放大系数</div><div class="param-value">{trend_factor:.2f}</div></div>
-                    <div class="param-item"><div class="param-label"><i class="fas fa-clock"></i> 补货周期</div><div class="param-value">{intermittent_cycle} 天</div></div>
-                    <div class="param-item"><div class="param-label"><i class="fas fa-dollar-sign"></i> 订货成本K</div><div class="param-value">¥{ordering_cost_K:.1f}</div></div>
-                    <div class="param-item"><div class="param-label"><i class="fas fa-percent"></i> 服务水平</div><div class="param-value">{user_service_level*100:.0f}%</div></div>
+                    <div class="param-item"><div class="param-label">趋势放大系数</div><div class="param-value">{trend_factor:.2f}</div></div>
+                    <div class="param-item"><div class="param-label">补货周期</div><div class="param-value">{intermittent_cycle} 天</div></div>
+                    <div class="param-item"><div class="param-label">订货成本K</div><div class="param-value">¥{ordering_cost_K:.1f}</div></div>
+                    <div class="param-item"><div class="param-label">服务水平</div><div class="param-value">{user_service_level*100:.0f}%</div></div>
                 </div>
                 """, unsafe_allow_html=True)
                 st.markdown("<h3>智能订货建议</h3>", unsafe_allow_html=True)
                 display_df = result_df[['商品简称', '需求类型', '策略', '安全库存', '订货点', '目标库存', '建议补货量', '优先级',
                                         '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '成本增加额(元/天)', '成本增加(%)']].copy()
+                # 对于 (T,S) 策略，服务水平不适用，显示为横杠
+                display_df.loc[display_df['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
+                display_df.loc[display_df['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
+                # 数值格式化
                 for col in ['安全库存', '订货点', '目标库存', '建议补货量', '日总成本(用户)', '成本增加额(元/天)']:
                     if col in display_df.columns:
                         display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
@@ -1637,7 +1665,7 @@ elif st.session_state.page == "库存优化":
                     avg_increase = result_df['成本增加(%)'].mean()
                     st.markdown(f"""
                     <div class="cost-card">
-                        <div class="cost-label"><i class="fas fa-chart-line"></i> 所有SKU每日总成本增加</div>
+                        <div class="cost-label">所有SKU每日总成本增加</div>
                         <div class="cost-value">¥{total_extra:.2f}</div>
                         <div class="cost-sub">平均增幅 {avg_increase:.1f}%</div>
                     </div>
@@ -1647,11 +1675,16 @@ elif st.session_state.page == "库存优化":
                     worst_extra = result_df['成本增加额(元/天)'].max()
                     st.markdown(f"""
                     <div class="cost-card">
-                        <div class="cost-label"><i class="fas fa-coins"></i> 单个SKU最小/最大额外成本</div>
+                        <div class="cost-label">单个SKU最小/最大额外成本</div>
                         <div class="cost-value">¥{best_saving:.2f} / ¥{worst_extra:.2f}</div>
                     </div>
                     """, unsafe_allow_html=True)
                 cost_table = result_df[['商品简称', '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)', '成本增加(%)']].copy()
+                # 添加策略列用于筛选，然后替换 (T,S) 的服务水平
+                cost_table['策略'] = result_df['策略']
+                cost_table.loc[cost_table['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
+                cost_table.loc[cost_table['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
+                cost_table.drop('策略', axis=1, inplace=True)
                 for col in ['用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)']:
                     if col in cost_table.columns:
                         cost_table[col] = cost_table[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
@@ -1662,6 +1695,7 @@ elif st.session_state.page == "库存优化":
                 st.download_button("📥 下载订货建议表", data=output.getvalue(), file_name="订货建议.xlsx")
             card(show_inventory)
 
+# 决策建议页面
 elif st.session_state.page == "决策建议":
     if st.session_state.result_df is None:
         st.warning("请先在「库存优化」页面生成订货建议。")
@@ -1682,18 +1716,23 @@ elif st.session_state.page == "决策建议":
                 else: return '正常'
             result_df['风险等级'] = result_df.apply(risk_level, axis=1)
             price_map = base_df.set_index('商品名称')['采购价'].to_dict()
-            result_df['库存金额'] = result_df['当前总库存'] * result_df['商品简称'].map(lambda x: price_map.get(base_df[base_df['商品简称']==x]['商品名称'].iloc[0] if len(base_df[base_df['商品简称']==x])>0 else 0) or 0)
+            def get_price(short_name):
+                full_names = base_df[base_df['商品简称'] == short_name]['商品名称'].values
+                if len(full_names) > 0:
+                    return price_map.get(full_names[0], 0)
+                return 0
+            result_df['库存金额'] = result_df['当前总库存'] * result_df['商品简称'].apply(get_price)
             
             healthy_count = len(result_df[result_df['风险等级'] == '正常'])
             shortage_count = len(result_df[result_df['风险等级'] == '缺货风险'])
             overstock_count = len(result_df[result_df['风险等级'] == '积压风险'])
-            total_order_value = (result_df['建议补货量'] * result_df['商品简称'].map(lambda x: price_map.get(base_df[base_df['商品简称']==x]['商品名称'].iloc[0] if len(base_df[base_df['商品简称']==x])>0 else 0) or 0)).sum()
+            total_order_value = sum(result_df['建议补货量'] * result_df['商品简称'].apply(get_price))
             
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 st.markdown(f"""
                 <div class="decision-card">
-                    <div class="decision-value"><i class="fas fa-check-circle" style="color: #16a34a; margin-right: 4px;"></i> {healthy_count}/{len(result_df)}</div>
+                    <div class="decision-value"><i class="fas fa-check-circle" style="color:#16a34a;"></i> {healthy_count}/{len(result_df)}</div>
                     <div class="decision-label">库存健康率</div>
                     <div class="decision-delta">{healthy_count/len(result_df)*100:.0f}%</div>
                 </div>
@@ -1701,7 +1740,7 @@ elif st.session_state.page == "决策建议":
             with col2:
                 st.markdown(f"""
                 <div class="decision-card">
-                    <div class="decision-value"><i class="fas fa-bell" style="color: #dc2626; margin-right: 4px;"></i> {shortage_count}</div>
+                    <div class="decision-value"><i class="fas fa-bell" style="color:#dc2626;"></i> {shortage_count}</div>
                     <div class="decision-label">缺货风险</div>
                     <div class="decision-delta">需立即补货</div>
                 </div>
@@ -1709,7 +1748,7 @@ elif st.session_state.page == "决策建议":
             with col3:
                 st.markdown(f"""
                 <div class="decision-card">
-                    <div class="decision-value"><i class="fas fa-box" style="color: #f97316; margin-right: 4px;"></i> {overstock_count}</div>
+                    <div class="decision-value"><i class="fas fa-box" style="color:#f97316;"></i> {overstock_count}</div>
                     <div class="decision-label">积压风险</div>
                     <div class="decision-delta">建议促销</div>
                 </div>
@@ -1717,7 +1756,7 @@ elif st.session_state.page == "决策建议":
             with col4:
                 st.markdown(f"""
                 <div class="decision-card">
-                    <div class="decision-value"><i class="fas fa-money-bill-wave" style="color: #eab308; margin-right: 4px;"></i> ¥{total_order_value:,.0f}</div>
+                    <div class="decision-value"><i class="fas fa-money-bill-wave" style="color:#eab308;"></i> ¥{total_order_value:,.0f}</div>
                     <div class="decision-label">建议补货金额</div>
                 </div>
                 """, unsafe_allow_html=True)
