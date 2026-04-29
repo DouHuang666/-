@@ -13,7 +13,7 @@ st.set_page_config(page_title="宠物IP联名产品库存智能决策系统", la
 
 st.markdown('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">', unsafe_allow_html=True)
 
-# ========== CSS（与您的原文件完全相同） ==========
+# ========== CSS ==========
 st.markdown("""
 <style>
     :root {
@@ -1650,6 +1650,9 @@ elif st.session_state.page == "库存优化":
                 st.markdown("<h3>智能订货建议</h3>", unsafe_allow_html=True)
                 display_df = result_df[['商品简称', '需求类型', '策略', '安全库存', '订货点', '目标库存', '建议补货量', '优先级',
                                         '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '成本增加额(元/天)', '成本增加(%)']].copy()
+                # 先将两列转换为 object 类型，以便可以存储字符串
+                display_df['用户服务水平(%)'] = display_df['用户服务水平(%)'].astype(object)
+                display_df['理论最优服务水平(%)'] = display_df['理论最优服务水平(%)'].astype(object)
                 # 对于 (T,S) 策略，服务水平不适用，显示为横杠
                 display_df.loc[display_df['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
                 display_df.loc[display_df['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
@@ -1682,6 +1685,9 @@ elif st.session_state.page == "库存优化":
                 cost_table = result_df[['商品简称', '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)', '成本增加(%)']].copy()
                 # 添加策略列用于筛选，然后替换 (T,S) 的服务水平
                 cost_table['策略'] = result_df['策略']
+                # 转换类型
+                cost_table['用户服务水平(%)'] = cost_table['用户服务水平(%)'].astype(object)
+                cost_table['理论最优服务水平(%)'] = cost_table['理论最优服务水平(%)'].astype(object)
                 cost_table.loc[cost_table['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
                 cost_table.loc[cost_table['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
                 cost_table.drop('策略', axis=1, inplace=True)
