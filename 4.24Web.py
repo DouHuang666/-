@@ -13,7 +13,7 @@ st.set_page_config(page_title="宠物IP联名产品库存智能决策系统", la
 
 st.markdown('<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">', unsafe_allow_html=True)
 
-# ========== CSS ==========
+# ========== CSS（保持不变，与原文件相同） ==========
 st.markdown("""
 <style>
     :root {
@@ -898,7 +898,7 @@ def solve_optimal_RQ(mu_d, sigma_d, L, H, B, K, max_iter=20, tol=1e-2):
         z = 0.0
     return Q, z
 
-# ========== 核心：compute_inventory_advice（修改 (T,S) 逻辑） ==========
+# ========== 核心：compute_inventory_advice（包含 (T,S) 完整逻辑） ==========
 def compute_inventory_advice(row, period_days, params, service_level_override=None):
     dtype = row['需求类型']
     mu_d = row['预测销量'] / period_days
@@ -919,25 +919,36 @@ def compute_inventory_advice(row, period_days, params, service_level_override=No
     def loss(z):
         return norm.pdf(z) - z * (1 - norm.cdf(z))
 
-    # ========== (T,S) 策略 ==========
+    # ========== (T,S) 策略（论文公式 4-21~4-25） ==========
     if dtype in ['间歇型（块状）需求', '平稳型需求（低频稳定）', '轻缓波动型需求']:
         strategy = '(T,S)'
-        SS = 0.0
         T_cycle = params.get('intermittent_cycle', 20)
-        # 关键修改：Q = mu_d * (T_cycle + L)，不设安全库存，目标库存等于订货批量
-        Q_used = mu_d * (T_cycle + L)
-        z_used = 0.0
-        ROP_display = '-'
-        S_target = Q_used
-        S_display = round(S_target, 0) if S_target else '-'
-        qty = max(0, S_target - cur_stock) if cur_stock < S_target else 0
-        # 服务水平不适用，用 None 标记（后续渲染成横杠）
-        service_level = None
+        sigma_TL = sigma_d * np.sqrt(T_cycle + L)
 
-        term_hold = H * (SS + Q_used / 2)
-        term_short = (B * mu_d / Q_used) * sigma_L * loss(z_used)
-        term_order = (K * mu_d) / Q_used
-        daily_cost = term_hold + term_short + term_order
+        if service_level_override is None:
+            if B > 0:
+                ratio = H * T_cycle / B
+                if ratio >= 1.0:
+                    z_used = 0.0
+                else:
+                    z_used = norm.ppf(1 - ratio)
+            else:
+                z_used = 0.0
+            CSL = norm.cdf(z_used) * 100
+        else:
+            CSL = service_level_override * 100
+            z_used = norm.ppf(service_level_override)
+
+        SS = z_used * sigma_TL
+        S_target = mu_d * (T_cycle + L) + SS
+        qty = max(0, S_target - cur_stock) if cur_stock < S_target else 0
+
+        avg_inv = SS + mu_d * T_cycle / 2
+        daily_hold = H * avg_inv
+        Gz = loss(z_used)
+        daily_short = (B / T_cycle) * sigma_TL * Gz
+        daily_order = K / T_cycle
+        daily_cost = daily_hold + daily_short + daily_order
 
         if qty > 0:
             priority = '高' if theta >= 0.18 else '中'
@@ -947,37 +958,35 @@ def compute_inventory_advice(row, period_days, params, service_level_override=No
         return pd.Series({
             '策略': strategy,
             '安全库存': round(SS, 0) if SS > 0 else '-',
-            '订货点': ROP_display,
-            '目标库存': S_display,
+            '订货点': '-',
+            '目标库存': round(S_target, 0),
             '建议补货量': round(qty, 0),
             '优先级': priority,
-            '服务水平': service_level,          # 这里为 None
+            '服务水平': round(CSL, 1),
             '期望日总成本': round(daily_cost, 2)
         })
 
-    # ========== (R,Q) 策略（原逻辑不变） ==========
+    # ========== (R,Q) 策略（原逻辑） ==========
     else:
         strategy = '(R,Q)'
         if service_level_override is not None:
-            CSL = service_level_override
-            z_used = norm.ppf(CSL)
+            CSL = service_level_override * 100
+            z_used = norm.ppf(service_level_override)
             Gz = loss(z_used)
             Q_used = np.sqrt(2 * mu_d / H * (K + B * sigma_L * Gz))
         else:
             Q_used, z_used = solve_optimal_RQ(mu_d, sigma_d, L, H, B, K)
-            CSL = norm.cdf(z_used)
+            CSL = norm.cdf(z_used) * 100
 
         SS = z_used * sigma_L
         ROP = mu_d * L + SS
-        ROP_display = round(ROP, 0)
-        S_display = '-'
         qty = max(0, Q_used) if cur_stock <= ROP else 0
-        service_level = round(CSL * 100, 1)
 
-        term_hold = H * (z_used * sigma_L + Q_used / 2)
-        term_short = (B * mu_d / Q_used) * sigma_L * loss(z_used)
-        term_order = (K * mu_d) / Q_used
-        daily_cost = term_hold + term_short + term_order
+        daily_hold = H * (SS + Q_used / 2)
+        Gz = loss(z_used)
+        daily_short = (B * mu_d / Q_used) * sigma_L * Gz
+        daily_order = (K * mu_d) / Q_used
+        daily_cost = daily_hold + daily_short + daily_order
 
         if qty > 0:
             priority = '高' if theta >= 0.18 else '中'
@@ -990,11 +999,11 @@ def compute_inventory_advice(row, period_days, params, service_level_override=No
         return pd.Series({
             '策略': strategy,
             '安全库存': round(SS, 0) if SS > 0 else '-',
-            '订货点': ROP_display,
-            '目标库存': S_display,
+            '订货点': round(ROP, 0),
+            '目标库存': '-',
             '建议补货量': round(qty, 0),
             '优先级': priority,
-            '服务水平': service_level,
+            '服务水平': round(CSL, 1),
             '期望日总成本': round(daily_cost, 2)
         })
 
@@ -1621,9 +1630,9 @@ elif st.session_state.page == "库存优化":
         }
         if st.button("生成订货建议", type="primary") or st.session_state.pop("trigger_advice", False):
             with st.spinner("正在计算最优订货建议..."):
-                # 计算理论最优服务水平下的成本 (service_level_override=None)
+                # 计算理论最优服务水平下的成本和参数
                 advice_opt = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=None), axis=1)
-                # 计算用户自定义服务水平下的成本
+                # 计算用户自定义服务水平下的成本和参数
                 advice_user = base_df.apply(lambda row: compute_inventory_advice(row, period, params_inv, service_level_override=user_service_level), axis=1)
                 result_df = pd.concat([
                     base_df[['商品简称', '需求类型', '预测销量', '当前总库存']],
@@ -1648,16 +1657,11 @@ elif st.session_state.page == "库存优化":
                 </div>
                 """, unsafe_allow_html=True)
                 st.markdown("<h3>智能订货建议</h3>", unsafe_allow_html=True)
-                display_df = result_df[['商品简称', '需求类型', '策略', '安全库存', '订货点', '目标库存', '建议补货量', '优先级',
+                # 构建显示表格：增加“当前库存”列
+                display_df = result_df[['商品简称', '需求类型', '策略', '当前总库存', '安全库存', '订货点', '目标库存', '建议补货量', '优先级',
                                         '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '成本增加额(元/天)', '成本增加(%)']].copy()
-                # 先将两列转换为 object 类型，以便可以存储字符串
-                display_df['用户服务水平(%)'] = display_df['用户服务水平(%)'].astype(object)
-                display_df['理论最优服务水平(%)'] = display_df['理论最优服务水平(%)'].astype(object)
-                # 对于 (T,S) 策略，服务水平不适用，显示为横杠
-                display_df.loc[display_df['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
-                display_df.loc[display_df['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
-                # 数值格式化
-                for col in ['安全库存', '订货点', '目标库存', '建议补货量', '日总成本(用户)', '成本增加额(元/天)']:
+                # 对数值列格式化（保留两位小数）
+                for col in ['当前总库存', '安全库存', '订货点', '目标库存', '建议补货量', '日总成本(用户)', '成本增加额(元/天)']:
                     if col in display_df.columns:
                         display_df[col] = display_df[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
                 render_table(display_df, add_serial=True)
@@ -1683,14 +1687,6 @@ elif st.session_state.page == "库存优化":
                     </div>
                     """, unsafe_allow_html=True)
                 cost_table = result_df[['商品简称', '用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)', '成本增加(%)']].copy()
-                # 添加策略列用于筛选，然后替换 (T,S) 的服务水平
-                cost_table['策略'] = result_df['策略']
-                # 转换类型
-                cost_table['用户服务水平(%)'] = cost_table['用户服务水平(%)'].astype(object)
-                cost_table['理论最优服务水平(%)'] = cost_table['理论最优服务水平(%)'].astype(object)
-                cost_table.loc[cost_table['策略'] == '(T,S)', '用户服务水平(%)'] = '-'
-                cost_table.loc[cost_table['策略'] == '(T,S)', '理论最优服务水平(%)'] = '-'
-                cost_table.drop('策略', axis=1, inplace=True)
                 for col in ['用户服务水平(%)', '理论最优服务水平(%)', '日总成本(用户)', '日总成本(最优)', '成本增加额(元/天)']:
                     if col in cost_table.columns:
                         cost_table[col] = cost_table[col].apply(lambda x: f"{x:.2f}" if isinstance(x, (int, float)) else x)
